@@ -68,23 +68,35 @@ echo "║  ChatBantu v2 — Real-Time Social Network                    ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo
 
-# Check for bantu binary
-BANTU_BIN="$SCRIPT_DIR/bantu"
-if [[ ! -x "$BANTU_BIN" ]]; then
-  echo "✗ Bantu binary not found at: $BANTU_BIN"
+# Check for bantu binary — prefer local dir, fall back to PATH (Docker)
+BANTU_BIN=""
+if [[ -x "$SCRIPT_DIR/bantu" ]]; then
+  BANTU_BIN="$SCRIPT_DIR/bantu"
+elif BANTU_BIN="$(command -v bantu 2>/dev/null)" && [[ -n "$BANTU_BIN" ]]; then
+  true  # found on PATH (e.g. /usr/local/bin/bantu in Docker)
+fi
+if [[ -z "$BANTU_BIN" || ! -x "$BANTU_BIN" ]]; then
+  echo "✗ Bantu binary not found (tried: $SCRIPT_DIR/bantu, PATH)"
   echo "  Run: ./dev.sh --build"
   exit 1
 fi
 
-# Check for wsrelay binary
-WSRELAY_BIN="$SCRIPT_DIR/wsrelay"
-if [[ ! -x "$WSRELAY_BIN" ]]; then
-  echo "▶ wsrelay not found, building from source…"
-  if command -v gcc >/dev/null 2>&1; then
-    gcc -O2 -pthread -o "$WSRELAY_BIN" "$SCRIPT_DIR/wsrelay.c" -lsqlite3
+# Check for wsrelay binary — prefer local dir, fall back to PATH (Docker)
+WSRELAY_BIN=""
+if [[ -x "$SCRIPT_DIR/wsrelay" ]]; then
+  WSRELAY_BIN="$SCRIPT_DIR/wsrelay"
+elif WSRELAY_BIN="$(command -v wsrelay 2>/dev/null)" && [[ -n "$WSRELAY_BIN" ]]; then
+  true  # found on PATH
+else
+  # Try to build from source if gcc is available
+  if [[ -f "$SCRIPT_DIR/wsrelay.c" ]] && command -v gcc >/dev/null 2>&1; then
+    echo "▶ wsrelay not found, building from source…"
+    gcc -O2 -pthread -o "$SCRIPT_DIR/wsrelay" "$SCRIPT_DIR/wsrelay.c" -lsqlite3
+    WSRELAY_BIN="$SCRIPT_DIR/wsrelay"
     echo "  ✓ wsrelay built"
   else
-    echo "✗ gcc not found. Cannot build wsrelay."
+    echo "✗ wsrelay binary not found (tried: $SCRIPT_DIR/wsrelay, PATH)"
+    echo "  gcc not available for source build either."
     exit 1
   fi
 fi

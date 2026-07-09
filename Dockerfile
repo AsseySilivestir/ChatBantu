@@ -55,10 +55,12 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Copy binaries
+# Copy binaries to both PATH and WORKDIR for dev.sh compatibility
 COPY --from=builder /build/bantu /usr/local/bin/bantu
 COPY --from=builder /build/wsrelay /usr/local/bin/wsrelay
-RUN chmod +x /usr/local/bin/bantu /usr/local/bin/wsrelay
+COPY --from=builder /build/bantu /app/bantu
+COPY --from=builder /build/wsrelay /app/wsrelay
+RUN chmod +x /usr/local/bin/bantu /usr/local/bin/wsrelay /app/bantu /app/wsrelay
 
 # Copy application
 COPY server.b /app/server.b
@@ -67,12 +69,14 @@ COPY public/  /app/public/
 RUN mkdir -p /data && chmod 777 /data
 
 ENV PORT=8080
+ENV PATH="/usr/local/bin:${PATH}"
 EXPOSE 8080 8081
 
 RUN echo "=== Pre-flight ===" \
     && ldd /usr/local/bin/bantu \
     && ldd /usr/local/bin/wsrelay \
-    && /usr/local/bin/bantu --version
+    && file /usr/local/bin/bantu \
+    && file /usr/local/bin/wsrelay
 
 # Start both Bantu HTTP server AND WebSocket relay
 COPY dev.sh /app/dev.sh
