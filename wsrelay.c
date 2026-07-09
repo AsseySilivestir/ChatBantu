@@ -1,8 +1,7 @@
-{#include <stddef.h>}
-Written wsrelay.c
-� Standalone WebSocket Relay Server for ChatBantu
+/*
+ * wsrelay.c - Standalone WebSocket Relay Server for ChatBantu
  *
- * Compiles: gcc -O2 -pthread -o wsrelay wsrelay.c -ldl -lsqlite3
+ * Compiles: gcc -O2 -pthread -o wsrelay wsrelay.c -lsqlite3
  * Runs:     ./wsrelay 8081 /path/to/chatbantu.db
  *
  * Protocol:
@@ -12,6 +11,7 @@ Written wsrelay.c
  *   - HTTP POST  /broadcast  { type: "...", data: {...} } -> all connected
  */
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -346,7 +346,7 @@ static int handle_http_api(int fd, const char *method, const char *path, const c
                     if (restStart) {
                         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
                             ",\"fromName\":\"\""); 
-                        /* We just send the type, to, from, fromName, and data — 
+                        /* We just send the type, to, from, fromName, and data â 
                            the relay doesn't need the original from value again */
                     }
                 }
