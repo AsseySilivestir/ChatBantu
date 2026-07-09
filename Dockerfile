@@ -74,9 +74,7 @@ EXPOSE 8080 8081
 
 RUN echo "=== Pre-flight ===" \
     && ldd /usr/local/bin/bantu \
-    && ldd /usr/local/bin/wsrelay \
-    && file /usr/local/bin/bantu \
-    && file /usr/local/bin/wsrelay
+    && ldd /usr/local/bin/wsrelay
 
 # Start both Bantu HTTP server AND WebSocket relay
 COPY dev.sh /app/dev.sh
