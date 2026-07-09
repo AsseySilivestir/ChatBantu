@@ -1,12 +1,12 @@
 # ════════════════════════════════════════════════════════════════════
 #  ChatBantu — Local Development Dockerfile (fast iteration)
 #
-#  Unlike the production Dockerfile (multi-stage, builds Bantu from source),
-#  this one assumes a PREBUILT bantu binary in the repo root and just copies
-#  it into a minimal Ubuntu 22.04 image with the runtime libraries.
+#  Assumes PREBUILT bantu + wsrelay binaries in the repo root.
+#  Includes nginx for full real-time (same as production).
+#  Build time: ~10 seconds (vs ~3 minutes for production Dockerfile).
 #
-#  Build time: ~5 seconds (vs ~3 minutes for the production Dockerfile).
-#  Use for local development only. For Render, use the main Dockerfile.
+#  Run:  ./dev.sh --docker
+#  Open: http://localhost:8080
 # ════════════════════════════════════════════════════════════════════
 
 FROM ubuntu:22.04
@@ -15,7 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Africa/Dar_es_Salaam
 ENV PORT=8080
 
-# Runtime libraries only — no build tools, no dev headers.
+# Runtime libs + nginx
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libsqlite3-0 \
@@ -23,23 +23,30 @@ RUN apt-get update \
         ca-certificates \
         sqlite3 \
         curl \
+        nginx \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy prebuilt binary + app
+# Copy prebuilt binaries
 COPY bantu   /usr/local/bin/bantu
+COPY wsrelay /usr/local/bin/wsrelay
+RUN chmod +x /usr/local/bin/bantu /usr/local/bin/wsrelay
+
+# Copy app
 COPY server.b /app/server.b
 COPY public/  /app/public/
 
-RUN chmod +x /usr/local/bin/bantu
+# Copy nginx config (same as production — /ws → wsrelay, /* → bantu)
+COPY nginx.conf /etc/nginx/nginx.conf
+RUN rm -f /etc/nginx/sites-enabled/default
 
-# SQLite will be written here in the container (use a volume to persist)
+# Copy entrypoint (starts wsrelay + bantu + nginx)
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
 RUN mkdir -p /data && chmod 777 /data
 
-EXPOSE 8080
+EXPOSE ${PORT}
 
-# Quick smoke test before CMD
-RUN /usr/local/bin/bantu --version
-
-CMD ["bantu", "run", "server.b"]
+CMD ["/app/docker-entrypoint.sh"]
