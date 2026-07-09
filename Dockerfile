@@ -1,6 +1,12 @@
 # ════════════════════════════════════════════════════════════════════
 #  ChatBantu v2 — Multi-stage Dockerfile for Render
 #  Real-time: WebSocket relay + embedded TURN (Bantu v1.3.0)
+#
+#  ARCHITECTURE (single-port for Render):
+#    Render exposes only $PORT (10000). All traffic enters through
+#    nginx on that port, which multiplexes:
+#      /ws/*  → wsrelay (port 8081, internal only)
+#      /*     → Bantu HTTP (port 8080, internal only)
 # ════════════════════════════════════════════════════════════════════
 
 # ─── Stage 1: Builder ──────────────────────────────────────────────
@@ -30,7 +36,6 @@ RUN cd /build/compiler \
     && ./build.sh
 
 RUN test -f /build/compiler/build/bantu \
-    && file /build/compiler/build/bantu \
     && cp /build/compiler/build/bantu /build/bantu \
     && chmod +x /build/bantu
 
@@ -51,32 +56,38 @@ RUN apt-get update \
         ca-certificates \
         sqlite3 \
         libcurl4 \
+        nginx \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy binaries to both PATH and WORKDIR for dev.sh compatibility
+# Copy binaries
 COPY --from=builder /build/bantu /usr/local/bin/bantu
 COPY --from=builder /build/wsrelay /usr/local/bin/wsrelay
-COPY --from=builder /build/bantu /app/bantu
-COPY --from=builder /build/wsrelay /app/wsrelay
-RUN chmod +x /usr/local/bin/bantu /usr/local/bin/wsrelay /app/bantu /app/wsrelay
+RUN chmod +x /usr/local/bin/bantu /usr/local/bin/wsrelay
 
 # Copy application
 COPY server.b /app/server.b
 COPY public/  /app/public/
 
+# Copy nginx config — overwrites default
+COPY nginx.conf /etc/nginx/nginx.conf
+
+# Copy and prepare entrypoint
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+# Remove default nginx site config (we use /etc/nginx/nginx.conf directly)
+RUN rm -f /etc/nginx/sites-enabled/default
+
 RUN mkdir -p /data && chmod 777 /data
 
-ENV PORT=8080
+# Render sets PORT=10000 — nginx will listen on this port
+ENV PORT=10000
 ENV PATH="/usr/local/bin:${PATH}"
-EXPOSE 8080 8081
 
-RUN echo "=== Pre-flight ===" \
-    && ldd /usr/local/bin/bantu \
-    && ldd /usr/local/bin/wsrelay
+# Expose only the nginx port — the single port Render forwards to
+EXPOSE ${PORT}
 
-# Start both Bantu HTTP server AND WebSocket relay
-COPY dev.sh /app/dev.sh
-RUN chmod +x /app/dev.sh
-CMD ["/app/dev.sh"]
+# Entrypoint: starts wsrelay + bantu internally, then nginx on $PORT
+CMD ["/app/docker-entrypoint.sh"]

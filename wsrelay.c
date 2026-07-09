@@ -252,6 +252,7 @@ static void http_send(int fd, int code, const char *status, const char *ctype, c
     send(fd, resp, n, MSG_NOSIGNAL);
 }
 
+/* Parse an integer from JSON — handles both "key":42 and "key":"42" */
 static int json_get_int(const char *json, const char *key) {
     char search[256], buf[64]; buf[0] = '\0';
     snprintf(search, sizeof(search), "\"%s\"", key);
@@ -259,12 +260,71 @@ static int json_get_int(const char *json, const char *key) {
     if (!p) return 0;
     p += strlen(search);
     while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
-    if (*p != '"') return 0;
-    p++;
-    size_t i = 0;
-    while (*p && *p != '"' && i < sizeof(buf) - 1) { if (*p == '\\' && *(p+1)) p++; buf[i++] = *p++; }
-    buf[i] = '\0';
-    return atoi(buf);
+    if (*p == '"') {
+        p++;
+        size_t i = 0;
+        while (*p && *p != '"' && i < sizeof(buf) - 1) {
+            if (*p == '\\' && *(p+1)) p++;
+            buf[i++] = *p++;
+        }
+        buf[i] = '\0';
+        return atoi(buf);
+    } else if (*p == '-' || (*p >= '0' && *p <= '9')) {
+        size_t i = 0;
+        if (*p == '-') buf[i++] = *p++;
+        while (*p >= '0' && *p <= '9' && i < sizeof(buf) - 1) buf[i++] = *p++;
+        buf[i] = '\0';
+        return atoi(buf);
+    }
+    return 0;
+}
+
+/* Extract the raw JSON value for a key. Handles strings, objects, arrays, numbers. */
+static const char *json_extract_value(const char *json, const char *key, char *out, size_t max) {
+    char search[256];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(json, search);
+    if (!p) return NULL;
+    p += strlen(search);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+
+    if (*p == '"') {
+        size_t i = 0;
+        if (i < max - 1) out[i++] = *p++;
+        while (*p && i < max - 1) {
+            if (*p == '\\' && *(p+1) && i < max - 2) { out[i++] = *p++; }
+            out[i++] = *p++;
+            if (p[-1] == '"') break;
+        }
+        out[i] = '\0';
+    } else if (*p == '{' || *p == '[') {
+        char open = *p, close = (open == '{') ? '}' : ']';
+        int depth = 0;
+        size_t i = 0;
+        while (*p && i < max - 1) {
+            if (*p == '"') {
+                out[i++] = *p++;
+                while (*p && *p != '"' && i < max - 1) {
+                    if (*p == '\\' && *(p+1) && i < max - 2) { out[i++] = *p++; }
+                    out[i++] = *p++;
+                }
+                if (*p && i < max - 1) out[i++] = *p++;
+            } else {
+                if (*p == open) depth++;
+                else if (*p == close) depth--;
+                out[i++] = *p++;
+                if (depth == 0) break;
+            }
+        }
+        out[i] = '\0';
+    } else {
+        size_t i = 0;
+        while (*p && *p != ',' && *p != '}' && *p != ']' && *p != ' ' && *p != '\n' && *p != '\r' && i < max - 1) {
+            out[i++] = *p++;
+        }
+        out[i] = '\0';
+    }
+    return out;
 }
 
 static int handle_http_api(int fd, const char *method, const char *path, const char *body) {
@@ -289,68 +349,25 @@ static int handle_http_api(int fd, const char *method, const char *path, const c
         int toUserId = json_get_int(body, "to");
         if (toUserId > 0) {
             char typeBuf[64]; typeBuf[0] = '\0';
+            json_extract_value(body, "type", typeBuf, sizeof(typeBuf));
             const char *type = "message";
-            const char *typeStr = strstr(body, "\"type\"");
-            if (typeStr) {
-                typeStr += 7;
-                const char *val = typeStr;
-                while (*val && (*val == ' ' || *val == ':')) val++;
-                if (*val == '"') {
-                    val++; size_t di = 0;
-                    while (*val && *val != '"' && di < sizeof(typeBuf) - 1) {
-                        if (*val == '\\' && *(val+1)) val++;
-                        typeBuf[di++] = *val++;
-                    }
-                    typeBuf[di] = '\0';
-                    if (di > 0) type = typeBuf;
-                }
+            size_t tlen = strlen(typeBuf);
+            if (tlen >= 2 && typeBuf[0] == '"' && typeBuf[tlen-1] == '"') {
+                memmove(typeBuf, typeBuf + 1, tlen - 2);
+                typeBuf[tlen - 2] = '\0';
+                if (tlen > 2) type = typeBuf;
             }
             char dataBuf[65536]; dataBuf[0] = '\0';
-            const char *dataField = strstr(body, "\"data\"");
-            if (dataField) {
-                dataField += 6;
-                while (*dataField && (*dataField == ' ' || *dataField == ':')) dataField++;
-                if (*dataField == '"') {
-                    dataField++; size_t di = 0;
-                    while (*dataField && *dataField != '"' && di < sizeof(dataBuf) - 1) {
-                        if (*dataField == '\\' && *(dataField+1)) dataField++;
-                        dataBuf[di++] = *dataField++;
-                    }
-                    dataBuf[di] = '\0';
-                }
+            json_extract_value(body, "data", dataBuf, sizeof(dataBuf));
+            if (dataBuf[0] == '\0') {
+                dataBuf[0] = 'n'; dataBuf[1] = 'u';
+                dataBuf[2] = 'l'; dataBuf[3] = 'l'; dataBuf[4] = '\0';
             }
             int fromId = json_get_int(body, "from");
             char msg[65536];
             snprintf(msg, sizeof(msg),
-                "{\"type\":\"%s\",\"from\":%d,\"fromName\":\"%s\",\"data\":%s}",
-                type, fromId > 0 ? fromId : 0, "", dataBuf);
-            /* Append the rest of the original JSON after "from" for forwarded fields */
-            const char *fromStr = strstr(body, "\"from\"");
-            if (fromStr) {
-                fromStr += 6;
-                while (*fromStr && (*fromStr == ' ' || *fromStr == ':')) fromStr++;
-                if (*fromStr == '"') {
-                    fromStr++;
-                    const char *restStart = fromStr;
-                    /* Find where the value ends: skip the JSON string value */
-                    int depth = 1;
-                    while (*restStart && depth > 0) {
-                        if (*restStart == '\\') { restStart++; continue; }
-                        if (*restStart == '"') depth--;
-                        restStart++;
-                    }
-                    /* Append from=... and everything after it */
-                    size_t curLen = strlen(msg);
-                    snprintf(msg + curLen, sizeof(msg) - curLen,
-                        ",\"from\":%d", fromId > 0 ? fromId : 0);
-                    if (restStart) {
-                        snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
-                            ",\"fromName\":\"\""); 
-                        /* We just send the type, to, from, fromName, and data â 
-                           the relay doesn't need the original from value again */
-                    }
-                }
-            }
+                "{\"type\":\"%s\",\"from\":%d,\"fromName\":\"\",\"data\":%s}",
+                type, fromId > 0 ? fromId : 0, dataBuf);
             int sent = send_to_user(toUserId, msg);
             char resp[256];
             snprintf(resp, sizeof(resp), "{\"sent\":%d}", sent);
@@ -360,48 +377,9 @@ static int handle_http_api(int fd, const char *method, const char *path, const c
         }
         return 1;
     }
-    if (strcmp(method, "POST") == 0 && strcmp(path, "/broadcast") == 0) {
-        char typeBuf[64]; typeBuf[0] = '\0';
-        const char *type = "message";
-        const char *typeStr = strstr(body, "\"type\"");
-        if (typeStr) {
-            typeStr += 7;
-            const char *val = typeStr;
-            while (*val && (*val == ' ' || *val == ':')) val++;
-            if (*val == '"') {
-                val++; size_t di = 0;
-                while (*val && *val != '"' && di < sizeof(typeBuf) - 1) {
-                    if (*val == '\\' && *(val+1)) val++;
-                    typeBuf[di++] = *val++;
-                }
-                typeBuf[di] = '\0';
-                if (di > 0) type = typeBuf;
-            }
-        }
-        char dataBuf[65536]; dataBuf[0] = '\0';
-        const char *dataField = strstr(body, "\"data\"");
-        if (dataField) {
-            dataField += 6;
-            while (*dataField && (*dataField == ' ' || *dataField == ':')) dataField++;
-            if (*dataField == '"') {
-                dataField++; size_t di = 0;
-                while (*dataField && *dataField != '"' && di < sizeof(dataBuf) - 1) {
-                    if (*dataField == '\\' && *(dataField+1)) dataField++;
-                    dataBuf[di++] = *dataField++;
-                }
-                dataBuf[di] = '\0';
-            }
-        }
-        char msg[65536];
-        snprintf(msg, sizeof(msg), "{\"type\":\"%s\",\"data\":%s}", type, dataBuf);
-        int sent = broadcast_all(msg);
-        char resp[256];
-        snprintf(resp, sizeof(resp), "{\"sent\":%d}", sent);
-        http_send(fd, 200, "OK", "application/json", resp);
-        return 1;
-    }
     return 0;
 }
+
 
 static int parse_http_request(const char *buf, ssize_t len, char *method, size_t meth_max, char *path, size_t path_max, char *headers, size_t hdr_max, char *body, size_t body_max) {
     method[0] = path[0] = headers[0] = body[0] = '\0';

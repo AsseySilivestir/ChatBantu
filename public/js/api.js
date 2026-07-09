@@ -64,7 +64,9 @@ const api = {
 
 // ═══════════════════════════════════════════════════════════════
 //  REAL-TIME WEBSOCKET MANAGER
-//  Connects to wsrelay on the same host, port 8081.
+//  Connects to /ws on the SAME origin/port as the HTTP server.
+//  Nginx reverse-proxies /ws/* to the WebSocket relay internally.
+//  This works on both Render (single port via nginx) and local dev.
 //  Dispatches: message, call_offer, call_answer, call_ice,
 //              call_hangup, presence, notification, typing
 // ═══════════════════════════════════════════════════════════════
@@ -75,13 +77,14 @@ const WS = {
   _listeners: {},       // { eventType: [callback, ...] }
   _onlineUsers: {},     // { userId: { id, username, displayName } }
   _connected: false,
-  _relayPort: 8081,
 
   // ── Connect ──────────────────────────────────────────────
   connect() {
     if (!api.token()) return;
+    // Same-origin WebSocket — nginx reverse-proxies /ws to wsrelay internally.
+    // Works on Render (single port) AND local dev (direct to wsrelay if no nginx).
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = proto + '//' + location.hostname + ':' + this._relayPort + '/ws?token=' + encodeURIComponent(api.token());
+    const url = proto + '//' + location.host + '/ws?token=' + encodeURIComponent(api.token());
     this._ws = new WebSocket(url);
 
     this._ws.onopen = () => {

@@ -41,14 +41,22 @@
     document.getElementById('remote-label').textContent = peerName;
 
     // ─── ICE Configuration ───────────────────────────────
-    // Bantu v1.3.0 embedded TURN server — same host, port 3478
-    // Falls back to Google STUN for clients behind strict NATs
+    // Public STUN servers work everywhere (Render, local, etc.).
+    // Embedded TURN (port 3478) is available in local dev only —
+    // on Render's single-port, TURN is unreachable, so we rely on STUN
+    // which handles 90%+ of NAT scenarios. For production TURN,
+    // configure an external TURN service (Twilio, Xirsys, etc.).
+    const isLocal = location.port === '8080' || location.port === '';
     const ICE_CONFIG = {
       iceServers: [
-        { urls: 'turn:' + location.hostname + ':3478', username: 'bantu', credential: 'bantu123' },
-        { urls: 'stun:' + location.hostname + ':3478' },
-        { urls: 'stun:stun.l.google.com:19302' }
-      ]
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' }
+      ].concat(
+        isLocal
+          ? [{ urls: 'turn:' + location.hostname + ':3478', username: 'bantu', credential: 'bantu123' }]
+          : []
+      )
     };
 
     let pc = null;

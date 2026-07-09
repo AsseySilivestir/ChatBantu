@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════
 #  ChatBantu v2 — Local Development Launcher
-#  Real-time: Bantu HTTP + WebSocket Relay
+#  Real-time: Bantu HTTP + WebSocket Relay (via nginx proxy)
+#
+#  Architecture (same as Docker/Render):
+#    nginx on $PORT (default 8080) — the ONLY port browsers need
+#      /ws/*  → wsrelay (port 8081, internal)
+#      /*     → Bantu HTTP (port 9080, internal)
+#
+#  If nginx is not installed, falls back to direct mode:
+#    Bantu on $PORT, wsrelay on 8081 (WebSocket won't work
+#    because /ws hits Bantu, not wsrelay — install nginx!)
 # ════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -9,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PORT="${PORT:-8080}"
+BANTU_INTERNAL_PORT=9080
 WS_PORT="${WS_PORT:-8081}"
 DB_PATH="${DB_PATH:-./chatbantu.db}"
 OPEN_BROWSER=1
@@ -31,18 +41,22 @@ Usage:
   ./dev.sh                  Run the app (default)
   ./dev.sh --build          Rebuild Bantu + wsrelay from source
   ./dev.sh --reset-db       Wipe chatbantu.db before starting
-  ./dev.sh --port 9000      Use a custom HTTP port
+  ./dev.sh --port 9000      Use a custom external port
   ./dev.sh --no-browser     Don't auto-open the browser
-  ./dev.sh --docker         Run inside Docker
+  ./dev.sh --docker         Run inside Docker (uses Dockerfile)
   ./dev.sh --help           Show this help
 
-Architecture:
-  Bantu HTTP server  → http://localhost:8080
-  WebSocket relay     → ws://localhost:8081
-  Embedded TURN       → localhost:3478 (Bantu v1.3.0)
+Architecture (with nginx):
+  nginx (external)   → http://localhost:8080
+  Bantu HTTP (int.)  → http://localhost:9080
+  WebSocket relay    → ws://localhost:8081 (routed via nginx /ws)
+  Embedded TURN      → localhost:3478 (Bantu v1.3.0)
+
+Requirements for real-time:
+  - nginx (for /ws → wsrelay proxy). Falls back to API-only without it.
 
 Environment variables:
-  PORT      HTTP port (default: 8080)
+  PORT      External port (default: 8080)
   WS_PORT   WebSocket relay port (default: 8081)
   DB_PATH   SQLite path (default: ./chatbantu.db)
 EOF
@@ -51,7 +65,6 @@ EOF
   esac
 done
 
-export PORT
 export DB_PATH
 
 if [[ "$USE_DOCKER" -eq 1 ]]; then
@@ -131,45 +144,146 @@ if [[ "$RESET_DB" -eq 1 ]]; then
   echo "  ✓ Database deleted"
 fi
 
+# ── Check for nginx ──────────────────────────────────────────────
+HAS_NGINX=0
+NGINX_BIN=""
+if NGINX_BIN="$(command -v nginx 2>/dev/null)" && [[ -n "$NGINX_BIN" ]]; then
+  HAS_NGINX=1
+fi
+
+if [[ "$HAS_NGINX" -eq 0 ]]; then
+  echo "⚠  nginx not found — running in direct mode."
+  echo "   Real-time features (online status, live messages, notifications)"
+  echo "   will NOT work. Install nginx for full real-time support:"
+  echo "   sudo apt install nginx  OR  brew install nginx"
+  echo ""
+  DIRECT_MODE=1
+else
+  DIRECT_MODE=0
+fi
+
 echo
 echo "──────────────────────────────────────────────────────────────────"
 echo "  Bantu:    $BANTU_BIN"
 echo "  Relay:    $WSRELAY_BIN"
-echo "  HTTP:     http://localhost:$PORT"
-echo "  WebSocket:ws://localhost:$WS_PORT"
-echo "  TURN:     embedded (port 3478)"
+if [[ "$DIRECT_MODE" -eq 0 ]]; then
+  echo "  Mode:     nginx proxy (real-time ENABLED)"
+  echo "  External: http://localhost:$PORT"
+  echo "  Bantu:    http://localhost:$BANTU_INTERNAL_PORT (internal)"
+  echo "  WS Relay: ws://localhost:$WS_PORT (proxied via /ws)"
+else
+  echo "  Mode:     DIRECT (real-time DISABLED — install nginx)"
+  echo "  HTTP:     http://localhost:$PORT"
+  echo "  WS Relay: ws://localhost:$WS_PORT (NOT proxied)"
+fi
+echo "  TURN:     embedded (port 3478, local dev only)"
 echo "  DB:       $DB_PATH"
 echo "  Demo:     silivestir / bantu123"
 echo "──────────────────────────────────────────────────────────────────"
 echo
 
-# Cleanup function
+# ── PIDs for cleanup ─────────────────────────────────────────────
+WSRELAY_PID=""
+BANTU_PID=""
+NGINX_PID=""
+
 cleanup() {
   echo ""
   echo "▶ Shutting down…"
-  kill $WSRELAY_PID 2>/dev/null || true
-  wait $WSRELAY_PID 2>/dev/null || true
+  [[ -n "$NGINX_PID" ]] && { nginx -s stop 2>/dev/null || kill "$NGINX_PID" 2>/dev/null; } || true
+  [[ -n "$BANTU_PID" ]]  && kill "$BANTU_PID" 2>/dev/null || true
+  [[ -n "$WSRELAY_PID" ]] && kill "$WSRELAY_PID" 2>/dev/null || true
+  wait 2>/dev/null || true
+  # Remove temp nginx config
+  rm -f "$SCRIPT_DIR/.dev-nginx.conf"
   echo "  ✓ Stopped"
   exit 0
 }
 trap cleanup SIGINT SIGTERM
 
-# Start WebSocket relay in background
-echo "▶ Starting WebSocket relay on port $WS_PORT…"
+# ── Start WebSocket relay on 8081 (internal) ─────────────────────
+echo "▶ Starting WebSocket relay on 127.0.0.1:$WS_PORT…"
 "$WSRELAY_BIN" "$WS_PORT" "$DB_PATH" &
 WSRELAY_PID=$!
-sleep 0.5
-
-# Verify relay started
-if ! kill -0 $WSRELAY_PID 2>/dev/null; then
-  echo "✗ WebSocket relay failed to start"
-  exit 1
+sleep 0.3
+if ! kill -0 "$WSRELAY_PID" 2>/dev/null; then
+  echo "✗ WebSocket relay failed to start"; exit 1
 fi
-echo "  ✓ WebSocket relay running (pid $WSRELAY_PID)"
+echo "  ✓ wsrelay running (pid $WSRELAY_PID)"
 
-# Open browser
+# ── Determine Bantu port ─────────────────────────────────────────
+if [[ "$DIRECT_MODE" -eq 1 ]]; then
+  BANTU_LISTEN_PORT="$PORT"
+else
+  BANTU_LISTEN_PORT="$BANTU_INTERNAL_PORT"
+fi
+
+# ── Start Bantu HTTP (internal port 9080 if nginx, else $PORT) ──
+echo "▶ Starting Bantu HTTP on 127.0.0.1:$BANTU_LISTEN_PORT…"
+PORT="$BANTU_LISTEN_PORT" "$BANTU_BIN" run "$SCRIPT_DIR/server.b" &
+BANTU_PID=$!
+sleep 0.5
+if ! kill -0 "$BANTU_PID" 2>/dev/null; then
+  echo "✗ Bantu HTTP failed to start"; exit 1
+fi
+echo "  ✓ Bantu running (pid $BANTU_PID)"
+
+# ── Start nginx proxy (if available) ─────────────────────────────
+if [[ "$DIRECT_MODE" -eq 0 ]]; then
+  echo "▶ Generating nginx config for port $PORT…"
+  cat > "$SCRIPT_DIR/.dev-nginx.conf" <<NGINX
+worker_processes 1;
+daemon on;
+error_log /dev/stderr warn;
+pid $SCRIPT_DIR/.dev-nginx.pid;
+
+events {
+    worker_connections 256;
+}
+
+http {
+    access_log /dev/stdout combined;
+
+    upstream bantu_http {
+        server 127.0.0.1:$BANTU_INTERNAL_PORT;
+    }
+    upstream ws_relay {
+        server 127.0.0.1:$WS_PORT;
+    }
+
+    server {
+        listen $PORT;
+        server_name localhost;
+
+        location /ws {
+            proxy_pass http://ws_relay;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+        }
+
+        location / {
+            proxy_pass http://bantu_http;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+        }
+    }
+}
+NGINX
+
+  echo "▶ Starting nginx on port $PORT…"
+  nginx -c "$SCRIPT_DIR/.dev-nginx.conf"
+  NGINX_PID=$(cat "$SCRIPT_DIR/.dev-nginx.pid" 2>/dev/null || echo "")
+  echo "  ✓ nginx running (pid ${NGINX_PID:-unknown})"
+fi
+
+# ── Open browser ─────────────────────────────────────────────────
 if [[ "$OPEN_BROWSER" -eq 1 ]]; then
-  (sleep 1.5 && {
+  (sleep 1 && {
     URL="http://localhost:$PORT"
     if command -v xdg-open >/dev/null 2>&1; then
       xdg-open "$URL" >/dev/null 2>&1 || true
@@ -179,9 +293,16 @@ if [[ "$OPEN_BROWSER" -eq 1 ]]; then
   }) &
 fi
 
-echo "▶ Starting Bantu HTTP server on port $PORT…"
 echo ""
-exec "$BANTU_BIN" run "$SCRIPT_DIR/server.b" &
-BANTU_PID=$!
+if [[ "$DIRECT_MODE" -eq 0 ]]; then
+  echo "  ✅ ALL REAL-TIME FEATURES ENABLED via nginx proxy"
+else
+  echo "  ⚠️  Running without nginx — real-time features disabled"
+  echo "     Install nginx for online status, live messages & notifications"
+fi
+echo "  Open http://localhost:$PORT"
+echo ""
+
+# Wait for background processes
 wait $BANTU_PID 2>/dev/null
 cleanup
