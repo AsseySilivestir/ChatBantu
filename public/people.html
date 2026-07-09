@@ -35,9 +35,12 @@
           el.innerHTML = '<div class="card"><div class="empty-state"><div class="icon">👥</div><p>No other users yet.</p></div></div>';
           return;
         }
-        el.innerHTML = r.users.map(u => `
+        el.innerHTML = r.users.map(u => {
+          // Use WebSocket real-time presence when available, else DB-based
+          const online = WS.isUserOnline(u.id) || u.online;
+          return `
           <div class="user-card">
-            <div class="presence-dot ${u.online ? 'online' : ''}"></div>
+            <div class="presence-dot ${online ? 'online' : ''}"></div>
             <div class="avatar">${avatarLetter(u.displayName)}</div>
             <div class="name">${escapeHtml(u.displayName)}</div>
             <div class="uname">@${escapeHtml(u.username)}</div>
@@ -48,8 +51,8 @@
               </button>
               <button class="btn btn-accent btn-sm" onclick="location.href='/chat.html?peer=${u.id}'">Message</button>
             </div>
-          </div>
-        `).join('');
+          </div>`;
+        }).join('');
       } catch (e) {
         toast('Failed to load: ' + e.message);
       }
@@ -74,8 +77,11 @@
       }
     }
 
+    // Refresh user cards when presence changes (real-time)
+    WS.on('presence', () => load());
+    WS.on('connected', () => load());
+
     load();
-    setInterval(load, 30000);
   </script>
 </body>
 </html>

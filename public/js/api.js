@@ -1,10 +1,10 @@
 // ═══════════════════════════════════════════════════════════════
-// ChatBantu — Frontend API helper
-// Pure JavaScript, no frameworks. Talks to the Bantu backend.
+// ChatBantu v2 — Frontend API + Real-Time WebSocket Manager
+// Zero polling. All real-time via WebSocket relay.
 // ═══════════════════════════════════════════════════════════════
 
 const api = {
-  base: '',  // same origin
+  base: '',
 
   token() {
     return localStorage.getItem('cb_token') || '';
@@ -48,7 +48,6 @@ const api = {
       data = await res.text();
     }
     if (res.status === 401) {
-      // Auto-logout on auth failure
       this.clearSession();
       if (!window.location.pathname.endsWith('index.html') && !window.location.pathname.endsWith('/')) {
         window.location.href = '/';
@@ -61,6 +60,149 @@ const api = {
   post(path, body) { return this.request('POST', path, body); },
   put(path, body)  { return this.request('PUT',  path, body); },
   del(path)        { return this.request('DELETE', path); },
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  REAL-TIME WEBSOCKET MANAGER
+//  Connects to wsrelay on the same host, port 8081.
+//  Dispatches: message, call_offer, call_answer, call_ice,
+//              call_hangup, presence, notification, typing
+// ═══════════════════════════════════════════════════════════════
+
+const WS = {
+  _ws: null,
+  _reconnectTimer: null,
+  _listeners: {},       // { eventType: [callback, ...] }
+  _onlineUsers: {},     // { userId: { id, username, displayName } }
+  _connected: false,
+  _relayPort: 8081,
+
+  // ── Connect ──────────────────────────────────────────────
+  connect() {
+    if (!api.token()) return;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = proto + '//' + location.hostname + ':' + this._relayPort + '/ws?token=' + encodeURIComponent(api.token());
+    this._ws = new WebSocket(url);
+
+    this._ws.onopen = () => {
+      console.log('[WS] Connected to relay');
+      this._connected = true;
+      this._emit('connected', {});
+      // Clear any reconnect timer
+      if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+    };
+
+    this._ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        this._dispatch(msg);
+      } catch (e) {
+        console.warn('[WS] Parse error:', e);
+      }
+    };
+
+    this._ws.onclose = () => {
+      console.log('[WS] Disconnected');
+      this._connected = false;
+      this._onlineUsers = {};
+      this._emit('disconnected', {});
+      // Reconnect after 2s
+      this._reconnectTimer = setTimeout(() => this.connect(), 2000);
+    };
+
+    this._ws.onerror = (err) => {
+      console.warn('[WS] Error', err);
+    };
+  },
+
+  disconnect() {
+    if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+    if (this._ws) { try { this._ws.close(); } catch(e) {} this._ws = null; }
+    this._connected = false;
+  },
+
+  // ── Send a message through the WebSocket ────────────────
+  send(to, type, data) {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return false;
+    const payload = { to, type, data };
+    this._ws.send(JSON.stringify(payload));
+    return true;
+  },
+
+  // ── Event system ─────────────────────────────────────────
+  on(event, callback) {
+    if (!this._listeners[event]) this._listeners[event] = [];
+    this._listeners[event].push(callback);
+  },
+
+  off(event, callback) {
+    if (!this._listeners[event]) return;
+    this._listeners[event] = this._listeners[event].filter(cb => cb !== callback);
+  },
+
+  _emit(event, data) {
+    (this._listeners[event] || []).forEach(cb => {
+      try { cb(data); } catch (e) { console.warn('[WS] Handler error:', e); }
+    });
+  },
+
+  // ── Internal dispatch ────────────────────────────────────
+  _dispatch(msg) {
+    switch (msg.type) {
+      case 'connected':
+        // Welcome message from relay — we're authenticated
+        break;
+
+      case 'presence':
+        // Full online user list broadcast
+        this._onlineUsers = {};
+        if (msg.online) {
+          msg.online.forEach(u => { this._onlineUsers[u.id] = u; });
+        }
+        this._emit('presence', msg);
+        break;
+
+      case 'message':
+        // Real-time chat message from another user
+        this._emit('message', msg);
+        break;
+
+      case 'call_offer':
+        // Incoming WebRTC call offer
+        this._emit('call_offer', msg);
+        break;
+
+      case 'call_answer':
+        // WebRTC answer from callee
+        this._emit('call_answer', msg);
+        break;
+
+      case 'call_ice':
+        // ICE candidate from peer
+        this._emit('call_ice', msg);
+        break;
+
+      case 'call_hangup':
+        // Peer ended the call
+        this._emit('call_hangup', msg);
+        break;
+
+      default:
+        console.log('[WS] Unknown type:', msg.type, msg);
+    }
+  },
+
+  isConnected() {
+    return this._connected;
+  },
+
+  isUserOnline(userId) {
+    return !!this._onlineUsers[userId];
+  },
+
+  getOnlineUsers() {
+    return Object.values(this._onlineUsers);
+  }
 };
 
 // ─── Utilities ──────────────────────────────────────────────
@@ -128,9 +270,11 @@ function renderSidebar(active) {
       <button class="logout" title="Sign out" onclick="doLogout()">⏻</button>
     </div>
   `;
+
+  // Real-time unread badge updates via WebSocket
+  WS.on('message', () => refreshBadges());
+
   refreshBadges();
-  // Poll unread counts every 15s
-  setInterval(refreshBadges, 15000);
 }
 
 async function refreshBadges() {
@@ -146,6 +290,7 @@ async function refreshBadges() {
 }
 
 function doLogout() {
+  WS.disconnect();
   api.clearSession();
   window.location.href = '/';
 }
@@ -160,13 +305,13 @@ function escapeHtml(s) {
     .replace(/'/g, '&#39;');
 }
 
-// Heartbeat — keep us marked online
-setInterval(() => {
-  if (api.token()) {
-    api.post('/api/presence', {}).catch(() => {});
-  }
-}, 30000);
-// Send an immediate heartbeat on page load
+// ─── Global WebSocket Init ──────────────────────────────────
+// Every authenticated page connects to the relay on load.
 if (api.token()) {
-  api.post('/api/presence', {}).catch(() => {});
+  WS.connect();
 }
+
+// Cleanup on unload
+window.addEventListener('beforeunload', () => {
+  WS.disconnect();
+});

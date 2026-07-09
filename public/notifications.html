@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ChatBantu — Notifications</title>
   <link rel="stylesheet" href="/css/styles.css" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%AC%3C/text%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%94%3C/text%3E%3C/svg%3E" />
 </head>
 <body>
   <div class="app-shell">
@@ -16,6 +16,7 @@
           <h1>Notifications</h1>
           <p>Recent activity from your network</p>
         </div>
+        <button class="btn btn-ghost btn-sm" onclick="load()">Refresh</button>
       </div>
       <div id="notif-list" class="card"></div>
     </main>
@@ -51,6 +52,9 @@
         toast('Failed to load: ' + e.message);
       }
     }
+
+    // Auto-refresh notifications when a new message or event arrives
+    WS.on('message', () => { load(); refreshBadges(); });
 
     load();
   </script>

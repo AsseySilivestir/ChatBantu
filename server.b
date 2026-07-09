@@ -1,29 +1,40 @@
 // ════════════════════════════════════════════════════════════════════
-//  ChatBantu — Social Network Backend
+//  ChatBantu v2 — Social Network Backend (Real-Time)
 //  ────────────────────────────────────────────────────────────────────
 //  Pure Bantu Language + Sua Framework + SQLite
 //  Features:
 //    • User registration & login (token-based, no external deps)
 //    • Social feed: posts, likes, comments
 //    • Friendships: follow / unfollow
-//    • Real-time 1-to-1 chat (HTTP long-poll fallback)
-//    • Presence: online/offline via heartbeat
-//    • WebRTC signaling: offer / answer / ICE exchange
+//    • Real-time 1-to-1 chat via WebSocket relay (ZERO polling)
+//    • Presence: online/offline via WebSocket connections
+//    • WebRTC signaling: offer/answer/ICE via WebSocket (real-time)
+//    • Embedded TURN server (Bantu v1.3.0) for NAT traversal
 //    • Live notifications
 //
-//  Run:    bantu run server.b
-//  HTTP:   http://0.0.0.0:$PORT
-//  DB:     /data/chatbantu.db (Render volume) or ./chatbantu.db (local)
+//  Architecture:
+//    1. Bantu HTTP server (this file) — REST API + static files
+//    2. wsrelay (wsrelay.c) — WebSocket relay on port 8081
+//       Clients connect to wsrelay for all real-time events.
+//       The Bantu server forwards messages to wsrelay via HTTP.
+//    3. Bantu embedded TURN on port 3478 (v1.3.0)
+//
+//  Run:     bantu run server.b
+//  Relay:   ./wsrelay 8081 ./chatbantu.db
+//  HTTP:    http://0.0.0.0:$PORT
+//  DB:      /data/chatbantu.db (Render volume) or ./chatbantu.db (local)
 // ════════════════════════════════════════════════════════════════════
 
 print "═══════════════════════════════════════════";
-print "  ChatBantu — Social Network Backend";
-print "  Pure Bantu + Sua + SQLite";
+print "  ChatBantu v2 — Real-Time Social Network";
+print "  Pure Bantu + Sua + SQLite + WebSocket";
 print "═══════════════════════════════════════════";
 
 // ─── Configuration ───────────────────────────────────────────────────
 string $envPort = env("PORT");
 if (!$envPort) { $envPort = "8080"; }
+string $relayPort = "8081";
+string $relayUrl = "http://127.0.0.1:" + $relayPort;
 string $dbPath = "/data/chatbantu.db";
 
 // Probe persistent volume; fall back to local file
@@ -69,14 +80,7 @@ sua.sqlite.exec("CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(from_i
 sua.sqlite.exec("CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, type TEXT NOT NULL, body TEXT NOT NULL, link TEXT DEFAULT '', is_read INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')), FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE);");
 sua.sqlite.exec("CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id, is_read, id);");
 
-// WebRTC signaling — one row per offer / answer / ICE candidate.
-// 'type' is one of: offer, answer, ice.
-// 'payload' holds the SDP or candidate JSON string.
-// 'consumed' = 1 once the recipient has fetched it.
-sua.sqlite.exec("CREATE TABLE IF NOT EXISTS signaling (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, type TEXT NOT NULL, payload TEXT NOT NULL, consumed INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')), FOREIGN KEY (from_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY (to_id) REFERENCES users(id) ON DELETE CASCADE);");
-sua.sqlite.exec("CREATE INDEX IF NOT EXISTS idx_signal_to ON signaling(to_id, consumed, id);");
-
-print "[OK] Schema ready (users, follows, posts, likes, comments, messages, notifications, signaling).";
+print "[OK] Schema ready (users, follows, posts, likes, comments, messages, notifications).";
 
 // ─── Seed an admin user if empty ─────────────────────────────────────
 list $u = sua.sqlite.query("SELECT COUNT(*) AS n FROM users;");
@@ -87,14 +91,14 @@ if (num($u[0].n) == 0) {
     sua.sqlite.exec("INSERT INTO follows (follower_id, followee_id) VALUES (1, 2);");
     sua.sqlite.exec("INSERT INTO follows (follower_id, followee_id) VALUES (1, 3);");
     sua.sqlite.exec("INSERT INTO follows (follower_id, followee_id) VALUES (2, 1);");
-    sua.sqlite.exec("INSERT INTO posts (user_id, body) VALUES (1, 'Welcome to ChatBantu — a social network built entirely with the Bantu programming language and the Sua web framework! Real-time chat, video calls, and a feed, all powered by SQLite.');");
+    sua.sqlite.exec("INSERT INTO posts (user_id, body) VALUES (1, 'Welcome to ChatBantu v2 — real-time social networking powered by Bantu v1.3.0 with embedded TURN, WebSocket signaling, and zero polling. Video calls, voice calls, and chat are all instant now.');");
     sua.sqlite.exec("INSERT INTO posts (user_id, body) VALUES (2, 'Just shipped a new design portfolio. Loving how Bantu makes backend code feel familiar and clean.');");
     sua.sqlite.exec("INSERT INTO posts (user_id, body) VALUES (3, 'Coffee + code = happiness. Working on some new Bantu examples today.');");
     sua.sqlite.exec("INSERT INTO likes (post_id, user_id) VALUES (1, 2);");
     sua.sqlite.exec("INSERT INTO likes (post_id, user_id) VALUES (1, 3);");
     sua.sqlite.exec("INSERT INTO likes (post_id, user_id) VALUES (2, 1);");
-    sua.sqlite.exec("INSERT INTO comments (post_id, user_id, body) VALUES (1, 2, 'This is amazing! Proud of you, Silivestir.');");
-    sua.sqlite.exec("INSERT INTO comments (post_id, user_id, body) VALUES (1, 3, 'Bantu is going to change the game for African developers.');");
+    sua.sqlite.exec("INSERT INTO comments (post_id, user_id, body) VALUES (1, 2, 'This is amazing! Real-time everything now!');");
+    sua.sqlite.exec("INSERT INTO comments (post_id, user_id, body) VALUES (1, 3, 'Bantu v1.3.0 is going to change the game for African developers.');");
     print "[OK] Seeded 3 users + 3 posts + likes + comments.";
 }
 
@@ -126,7 +130,6 @@ def newToken() {
     string $hex = "0123456789abcdef";
     number $i = 0;
     while ($i < 32) {
-        // random(15) returns 0..15 inclusive — perfect index into $hex
         number $r = random(15);
         $t = $t + $hex[$r];
         $i = $i + 1;
@@ -134,19 +137,17 @@ def newToken() {
     return $t;
 }
 
-// Current epoch milliseconds (used as a monotonic message cursor).
+// Current epoch milliseconds.
 def nowMs() {
     return clock();
 }
 
 // Look up the user by the Bearer token in $req.headers.authorization.
-// Returns a dict {id, username, displayName} or null.
 def authUser($req) {
     dict $hdrs = $req.headers;
     string $auth = "";
     if ($hdrs.authorization) { $auth = $hdrs.authorization; }
     if (len($auth) < 8) { return null; }
-    // Expect "Bearer <token>"
     string $tok = substr($auth, 7);
     if (len($tok) < 8) { return null; }
 
@@ -159,7 +160,6 @@ def authUser($req) {
         "username": $rows[0].username,
         "displayName": $rows[0].display_name
     };
-    // Update last_seen
     sua.sqlite.exec("UPDATE users SET last_seen = " + str(nowMs()) + " WHERE id = " + str($u.id) + ";");
     return $u;
 }
@@ -192,12 +192,20 @@ def postFromRow($row, $likeCount, $commentCount) {
     return $p;
 }
 
-// Send a notification to $toUserId. type is "like" | "comment" | "follow" | "message".
+// Send a notification to $toUserId.
 def notify($toUserId, $type, $body, $link) {
     sua.sqlite.exec(
         "INSERT INTO notifications (user_id, type, body, link) VALUES (" +
         str($toUserId) + ", '" + esc($type) + "', '" + esc($body) + "', '" + esc($link) + "');"
     );
+}
+
+// Forward a real-time event to a user via the WebSocket relay.
+// This is how the Bantu HTTP server pushes events to connected clients.
+def relaySend($toUserId, $fromUserId, $type, $data) {
+    // Use sua.server.relay() to POST to the wsrelay /send endpoint
+    string $payload = "{\"to\":" + str($toUserId) + ",\"from\":" + str($fromUserId) + ",\"type\":\"" + $type + "\",\"data\":" + $data + "}";
+    sua.server.relay($relayUrl + "/send", $payload);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -288,23 +296,20 @@ def handleListUsers($req, $res) {
         "(SELECT COUNT(*) FROM follows WHERE follower_id = u.id) AS following_count, " +
         "(SELECT COUNT(*) FROM follows WHERE followee_id = u.id) AS followers_count, " +
         "EXISTS(SELECT 1 FROM follows WHERE follower_id = " + str($me.id) + " AND followee_id = u.id) AS is_following " +
-        "FROM users u WHERE u.id != " + str($me.id) + " ORDER BY u.display_name ASC LIMIT 100;"
+        "FROM users u WHERE u.id != " + str($me.id) + " ORDER BY u.display_name ASC LIMIT 500;"
     );
     list $out = [];
     number $i = 0;
     each ($r in $rows) {
-        dict $u = {
+        $out[$i] = {
             "id": num($r.id),
             "username": $r.username,
             "displayName": $r.display_name,
             "bio": $r.bio,
             "avatar": $r.avatar,
             "online": (nowMs() - num($r.last_seen)) < 60000,
-            "following": num($r.following_count),
-            "followers": num($r.followers_count),
             "isFollowing": $r.is_following == 1
         };
-        $out[$i] = $u;
         $i = $i + 1;
     }
     $res.json({"users": $out, "count": len($out)});
@@ -316,26 +321,21 @@ def handleFollow($req, $res) {
         $res.status(401).json({"error": "Not authenticated"});
         return null;
     }
-    number $target = num($req.params.id);
-    if ($target == $me.id) {
-        $res.status(400).json({"error": "Cannot follow yourself"});
-        return null;
-    }
+    number $targetId = num($req.params.id);
     list $exists = sua.sqlite.query(
-        "SELECT id FROM follows WHERE follower_id = " + str($me.id) + " AND followee_id = " + str($target) + ";"
+        "SELECT id FROM follows WHERE follower_id = " + str($me.id) + " AND followee_id = " + str($targetId) + ";"
     );
     if (len($exists) > 0) {
-        $res.json({"following": true, "message": "Already following"});
+        $res.json({"error": "Already following"});
         return null;
     }
     sua.sqlite.exec(
-        "INSERT INTO follows (follower_id, followee_id) VALUES (" + str($me.id) + ", " + str($target) + ");"
+        "INSERT INTO follows (follower_id, followee_id) VALUES (" + str($me.id) + ", " + str($targetId) + ");"
     );
-    list $tu = sua.sqlite.query("SELECT username, display_name FROM users WHERE id = " + str($target) + ";");
-    if (len($tu) > 0) {
-        notify($target, "follow", $me.displayName + " started following you.", "/u/" + $me.username);
-    }
-    $res.json({"following": true, "message": "Followed"});
+    notify($targetId, "follow", $me.displayName + " started following you.", "/people");
+    // Real-time: push follow notification via relay
+    relaySend($targetId, $me.id, "notification", "{\"body\":\"" + esc($me.displayName) + " started following you.\"}");
+    $res.status(201).json({"ok": true, "message": "Followed"});
 }
 
 def handleUnfollow($req, $res) {
@@ -344,15 +344,15 @@ def handleUnfollow($req, $res) {
         $res.status(401).json({"error": "Not authenticated"});
         return null;
     }
-    number $target = num($req.params.id);
+    number $targetId = num($req.params.id);
     sua.sqlite.exec(
-        "DELETE FROM follows WHERE follower_id = " + str($me.id) + " AND followee_id = " + str($target) + ";"
+        "DELETE FROM follows WHERE follower_id = " + str($me.id) + " AND followee_id = " + str($targetId) + ";"
     );
-    $res.json({"following": false, "message": "Unfollowed"});
+    $res.json({"ok": true, "message": "Unfollowed"});
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  POSTS (Social Feed)
+//  POSTS / FEED
 // ════════════════════════════════════════════════════════════════════
 
 def handleListPosts($req, $res) {
@@ -362,20 +362,19 @@ def handleListPosts($req, $res) {
         return null;
     }
     list $rows = sua.sqlite.query(
-        "SELECT p.id, p.user_id, p.body, p.image, p.created_at, " +
-        "u.display_name AS author_name, u.username AS author_username, " +
+        "SELECT p.*, u.username AS author_username, u.display_name AS author_name, " +
         "(SELECT COUNT(*) FROM likes WHERE post_id = p.id) AS like_count, " +
         "(SELECT COUNT(*) FROM comments WHERE post_id = p.id) AS comment_count, " +
         "EXISTS(SELECT 1 FROM likes WHERE post_id = p.id AND user_id = " + str($me.id) + ") AS liked " +
         "FROM posts p JOIN users u ON u.id = p.user_id " +
+        "WHERE p.user_id IN (SELECT followee_id FROM follows WHERE follower_id = " + str($me.id) + ") OR p.user_id = " + str($me.id) + " " +
         "ORDER BY p.created_at DESC LIMIT 100;"
     );
     list $out = [];
     number $i = 0;
     each ($r in $rows) {
-        dict $p = postFromRow($r, $r.like_count, $r.comment_count);
-        $p.liked = $r.liked == 1;
-        $out[$i] = $p;
+        $out[$i] = postFromRow($r, num($r.like_count), num($r.comment_count));
+        $out[$i].liked = ($r.liked == 1);
         $i = $i + 1;
     }
     $res.json({"posts": $out, "count": len($out)});
@@ -392,10 +391,9 @@ def handleCreatePost($req, $res) {
         return null;
     }
     string $image = "";
-    if ($req.body.image) { $image = $req.body.image; }
+    if ($req.body.image) { $image = esc($req.body.image); }
     dict $ins = sua.sqlite.exec(
-        "INSERT INTO posts (user_id, body, image) VALUES (" + str($me.id) + ", '" +
-        esc($req.body.body) + "', '" + esc($image) + "');"
+        "INSERT INTO posts (user_id, body, image) VALUES (" + str($me.id) + ", '" + esc($req.body.body) + "', '" + $image + "');"
     );
     $res.status(201).json({
         "post": {
@@ -501,9 +499,15 @@ def handleCreateComment($req, $res) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  REAL-TIME CHAT (polling-based)
-//  Client polls /api/messages/:userId?since=<id> every 1–2 seconds.
-//  New messages with id > since are returned immediately.
+//  REAL-TIME CHAT (WebSocket)
+//  Messages are stored in SQLite for history.
+//  Delivery is instant via WebSocket relay — ZERO polling.
+//  Flow:
+//    A: POST /api/messages/:toId  {body}
+//       → inserts into SQLite
+//       → forwards to wsrelay → B's WebSocket
+//    B: receives msg via WS event "message" instantly
+//    B: opens chat → GET /api/messages/:peerId (history, one-time)
 // ════════════════════════════════════════════════════════════════════
 
 def handleListMessages($req, $res) {
@@ -559,6 +563,11 @@ def handleSendMessage($req, $res) {
         "INSERT INTO messages (from_id, to_id, body) VALUES (" + str($me.id) + ", " + str($peerId) + ", '" + esc($req.body.body) + "');"
     );
     notify($peerId, "message", $me.displayName + " sent you a message.", "/chat/" + str($me.id));
+
+    // Real-time: push message to recipient via WebSocket relay
+    string $msgData = "{\"body\":\"" + esc($req.body.body) + "\",\"id\":" + str(num($ins.lastInsertId)) + "}";
+    relaySend($peerId, $me.id, "message", $msgData);
+
     $res.status(201).json({
         "message": {
             "id": num($ins.lastInsertId),
@@ -577,8 +586,6 @@ def handleConversations($req, $res) {
         $res.status(401).json({"error": "Not authenticated"});
         return null;
     }
-    // Last message per peer — use UNION to gather both directions,
-    // then pick the max id per peer_id.
     list $rows = sua.sqlite.query(
         "SELECT m.id, m.from_id, m.to_id, m.body, m.created_at, m.delivered, " +
         "  CASE WHEN m.from_id = " + str($me.id) + " THEN m.to_id ELSE m.from_id END AS peer_id, " +
@@ -635,8 +642,10 @@ def handleUnreadCount($req, $res) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  PRESENCE — clients POST /api/presence every 30s; we update last_seen.
-//  Online = last_seen within last 60s.
+//  PRESENCE — tracked by WebSocket connections in wsrelay.
+//  Online = has an active WebSocket connection.
+//  The /api/presence endpoint is kept for initial load / fallback.
+//  Real-time presence updates come via WS "presence" events.
 // ════════════════════════════════════════════════════════════════════
 
 def handlePresenceHeartbeat($req, $res) {
@@ -706,189 +715,6 @@ def handleListNotifications($req, $res) {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  WEBRTC SIGNALING — exchange offer/answer/ICE between two users.
-//  Flow:
-//    A: POST /api/call/offer/:to   {sdp}      →  store offer
-//    B: GET  /api/call/offer/:fromA          →  fetch offer (consumed=1)
-//    B: POST /api/call/answer/:toA  {sdp}     →  store answer
-//    A: GET  /api/call/answer/:fromB         →  fetch answer (consumed=1)
-//    A,B: POST /api/call/ice/:to  {candidate}  →  store ICE
-//    A,B: GET  /api/call/ice/:from            →  fetch unconsumed ICE
-//    A,B: POST /api/call/hangup/:to           →  store hangup signal
-// ════════════════════════════════════════════════════════════════════
-
-def handleCallOfferPost($req, $res) {
-    dict $me = authUser($req);
-    if (!$me) {
-        $res.status(401).json({"error": "Not authenticated"});
-        return null;
-    }
-    number $toId = num($req.params.id);
-    if (!$req.body.sdp) {
-        $res.status(400).json({"error": "sdp is required"});
-        return null;
-    }
-    // Remove any previous unconsumed offers from me to this peer
-    sua.sqlite.exec(
-        "DELETE FROM signaling WHERE from_id = " + str($me.id) + " AND to_id = " + str($toId) + " AND type = 'offer' AND consumed = 0;"
-    );
-    sua.sqlite.exec(
-        "INSERT INTO signaling (from_id, to_id, type, payload) VALUES (" + str($me.id) + ", " + str($toId) + ", 'offer', '" + esc($req.body.sdp) + "');"
-    );
-    notify($toId, "call", $me.displayName + " is calling you.", "/call/" + str($me.id));
-    $res.status(201).json({"ok": true, "message": "Offer sent"});
-}
-
-def handleCallOfferGet($req, $res) {
-    dict $me = authUser($req);
-    if (!$me) {
-        $res.status(401).json({"error": "Not authenticated"});
-        return null;
-    }
-    number $fromId = num($req.params.id);
-    list $rows = sua.sqlite.query(
-        "SELECT id, payload, created_at FROM signaling WHERE from_id = " + str($fromId) +
-        " AND to_id = " + str($me.id) + " AND type = 'offer' AND consumed = 0 ORDER BY id DESC LIMIT 1;"
-    );
-    if (len($rows) == 0) {
-        $res.json({"hasOffer": false});
-        return null;
-    }
-    sua.sqlite.exec("UPDATE signaling SET consumed = 1 WHERE id = " + str($rows[0].id) + ";");
-    $res.json({
-        "hasOffer": true,
-        "fromId": $fromId,
-        "sdp": $rows[0].payload,
-        "createdAt": $rows[0].created_at
-    });
-}
-
-def handleCallAnswerPost($req, $res) {
-    dict $me = authUser($req);
-    if (!$me) {
-        $res.status(401).json({"error": "Not authenticated"});
-        return null;
-    }
-    number $toId = num($req.params.id);
-    if (!$req.body.sdp) {
-        $res.status(400).json({"error": "sdp is required"});
-        return null;
-    }
-    sua.sqlite.exec(
-        "INSERT INTO signaling (from_id, to_id, type, payload) VALUES (" + str($me.id) + ", " + str($toId) + ", 'answer', '" + esc($req.body.sdp) + "');"
-    );
-    $res.status(201).json({"ok": true, "message": "Answer sent"});
-}
-
-def handleCallAnswerGet($req, $res) {
-    dict $me = authUser($req);
-    if (!$me) {
-        $res.status(401).json({"error": "Not authenticated"});
-        return null;
-    }
-    number $fromId = num($req.params.id);
-    list $rows = sua.sqlite.query(
-        "SELECT id, payload, created_at FROM signaling WHERE from_id = " + str($fromId) +
-        " AND to_id = " + str($me.id) + " AND type = 'answer' AND consumed = 0 ORDER BY id DESC LIMIT 1;"
-    );
-    if (len($rows) == 0) {
-        $res.json({"hasAnswer": false});
-        return null;
-    }
-    sua.sqlite.exec("UPDATE signaling SET consumed = 1 WHERE id = " + str($rows[0].id) + ";");
-    $res.json({
-        "hasAnswer": true,
-        "fromId": $fromId,
-        "sdp": $rows[0].payload,
-        "createdAt": $rows[0].created_at
-    });
-}
-
-def handleCallIcePost($req, $res) {
-    dict $me = authUser($req);
-    if (!$me) {
-        $res.status(401).json({"error": "Not authenticated"});
-        return null;
-    }
-    number $toId = num($req.params.id);
-    if (!$req.body.candidate) {
-        $res.status(400).json({"error": "candidate is required"});
-        return null;
-    }
-    sua.sqlite.exec(
-        "INSERT INTO signaling (from_id, to_id, type, payload) VALUES (" + str($me.id) + ", " + str($toId) + ", 'ice', '" + esc($req.body.candidate) + "');"
-    );
-    $res.status(201).json({"ok": true});
-}
-
-def handleCallIceGet($req, $res) {
-    dict $me = authUser($req);
-    if (!$me) {
-        $res.status(401).json({"error": "Not authenticated"});
-        return null;
-    }
-    number $fromId = num($req.params.id);
-    list $rows = sua.sqlite.query(
-        "SELECT id, payload FROM signaling WHERE from_id = " + str($fromId) +
-        " AND to_id = " + str($me.id) + " AND type = 'ice' AND consumed = 0 ORDER BY id ASC LIMIT 50;"
-    );
-    list $cands = [];
-    number $i = 0;
-    each ($r in $rows) {
-        $cands[$i] = $r.payload;
-        sua.sqlite.exec("UPDATE signaling SET consumed = 1 WHERE id = " + str($r.id) + ";");
-        $i = $i + 1;
-    }
-    $res.json({"candidates": $cands, "count": len($cands)});
-}
-
-def handleCallHangup($req, $res) {
-    dict $me = authUser($req);
-    if (!$me) {
-        $res.status(401).json({"error": "Not authenticated"});
-        return null;
-    }
-    number $toId = num($req.params.id);
-    // Clear all signaling rows between the two
-    sua.sqlite.exec(
-        "DELETE FROM signaling WHERE (from_id = " + str($me.id) + " AND to_id = " + str($toId) + ") OR (from_id = " + str($toId) + " AND to_id = " + str($me.id) + ");"
-    );
-    notify($toId, "call", $me.displayName + " ended the call.", "");
-    $res.json({"ok": true, "message": "Call ended"});
-}
-
-// Peek for an incoming call addressed to me WITHOUT consuming the offer.
-// The global poller in api.js calls this to ring the Accept banner; the
-// callee's call.html later performs the real (consuming) GET /api/call/offer.
-// Returns the newest unconsumed offer's caller id, name and video flag.
-def handleCallIncoming($req, $res) {
-    dict $me = authUser($req);
-    if (!$me) {
-        $res.status(401).json({"error": "Not authenticated"});
-        return null;
-    }
-    list $rows = sua.sqlite.query(
-        "SELECT s.from_id AS from_id, u.display_name AS from_name, s.payload AS payload, s.created_at AS created_at " +
-        "FROM signaling s JOIN users u ON u.id = s.from_id " +
-        "WHERE s.to_id = " + str($me.id) + " AND s.type = 'offer' AND s.consumed = 0 " +
-        "ORDER BY s.id DESC LIMIT 1;"
-    );
-    if (len($rows) == 0) {
-        $res.json({"incoming": false});
-        return null;
-    }
-    string $payload = $rows[0].payload;
-    bool $hasVideo = contains($payload, "m=video");
-    $res.json({
-        "incoming": true,
-        "fromId": num($rows[0].from_id),
-        "fromName": $rows[0].from_name,
-        "hasVideo": $hasVideo,
-        "createdAt": $rows[0].created_at
-    });
-}
-
-// ════════════════════════════════════════════════════════════════════
 //  HEALTH & OPTIONS
 // ════════════════════════════════════════════════════════════════════
 
@@ -899,7 +725,9 @@ def handleHealth($req, $res) {
         "framework": "Sua",
         "database": "SQLite",
         "app": "ChatBantu",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "realtime": "WebSocket",
+        "turn": "embedded (port 3478)",
         "serverTime": nowMs()
     });
 }
@@ -934,28 +762,18 @@ sua.server.post("/api/posts/:id/like",                handleLikePost);
 sua.server.get("/api/posts/:id/comments",             handleListComments);
 sua.server.post("/api/posts/:id/comments",            handleCreateComment);
 
-// Real-time chat (polling)
+// Real-time chat (WebSocket + SQLite for history)
 sua.server.get("/api/messages/:id",                   handleListMessages);
 sua.server.post("/api/messages/:id",                  handleSendMessage);
 sua.server.get("/api/conversations",                  handleConversations);
 sua.server.get("/api/unread",                         handleUnreadCount);
 
-// Presence
+// Presence (fallback — real-time via WS)
 sua.server.post("/api/presence",                      handlePresenceHeartbeat);
 sua.server.get("/api/presence",                       handlePresenceList);
 
 // Notifications
 sua.server.get("/api/notifications",                  handleListNotifications);
-
-// WebRTC signaling
-sua.server.post("/api/call/offer/:id",                handleCallOfferPost);
-sua.server.get("/api/call/offer/:id",                 handleCallOfferGet);
-sua.server.post("/api/call/answer/:id",               handleCallAnswerPost);
-sua.server.get("/api/call/answer/:id",                handleCallAnswerGet);
-sua.server.post("/api/call/ice/:id",                  handleCallIcePost);
-sua.server.get("/api/call/ice/:id",                   handleCallIceGet);
-sua.server.post("/api/call/hangup/:id",               handleCallHangup);
-sua.server.get("/api/call/incoming",                  handleCallIncoming);
 
 // CORS preflight
 sua.server.options("/*",                              handleOptions);
@@ -968,36 +786,17 @@ sua.server.static("./public");
 // ════════════════════════════════════════════════════════════════════
 print "";
 print "═══════════════════════════════════════════";
-print "  ChatBantu API ready on http://0.0.0.0:" + $envPort;
+print "  ChatBantu v2 API ready";
+print "  HTTP:     http://0.0.0.0:" + $envPort;
+print "  WS Relay: ws://0.0.0.0:" + $relayPort;
+print "  TURN:     embedded (port 3478)";
 print "  Database: " + $dbPath + " (SQLite)";
-print "  Real-time: HTTP polling (1-2s)";
-print "  Video:    WebRTC + Bantu signaling";
-print "  Endpoints:";
-print "    POST   /api/auth/register";
-print "    POST   /api/auth/login";
-print "    GET    /api/auth/me";
-print "    GET    /api/users";
-print "    POST   /api/users/:id/follow";
-print "    GET    /api/posts";
-print "    POST   /api/posts";
-print "    POST   /api/posts/:id/like";
-print "    GET    /api/posts/:id/comments";
-print "    POST   /api/posts/:id/comments";
-print "    GET    /api/messages/:id?since=N";
-print "    POST   /api/messages/:id";
-print "    GET    /api/conversations";
-print "    GET    /api/unread";
-print "    POST   /api/presence";
-print "    GET    /api/presence";
-print "    GET    /api/notifications";
-print "    POST   /api/call/offer/:id";
-print "    GET    /api/call/offer/:id";
-print "    POST   /api/call/answer/:id";
-print "    GET    /api/call/answer/:id";
-print "    POST   /api/call/ice/:id";
-print "    GET    /api/call/ice/:id";
-print "    POST   /api/call/hangup/:id";
+print "  Real-time: WebSocket (zero polling)";
+print "  Signaling: WebSocket relay";
 print "═══════════════════════════════════════════";
+print "";
+print "  To start the WebSocket relay:";
+print "    ./wsrelay " + $relayPort + " " + $dbPath;
 print "";
 
 sua.server.listen(num($envPort));

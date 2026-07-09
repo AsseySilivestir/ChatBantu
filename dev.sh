@@ -1,39 +1,21 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════
-#  ChatBantu — Local Development Launcher
-#  ────────────────────────────────────────────────────────────────────
-#  One-command setup that:
-#    1. Checks prerequisites (bantu binary + libs)
-#    2. Sets sensible PORT + DB path defaults
-#    3. (Optional) Rebuilds the Bantu binary from source
-#    4. (Optional) Resets the SQLite database to a clean state
-#    5. Starts the ChatBantu backend in the foreground
-#    6. (Optional) Opens the browser to the running site
-#
-#  Usage:
-#    ./dev.sh                  Run the app (default)
-#    ./dev.sh --build          Rebuild Bantu from source first
-#    ./dev.sh --reset-db       Wipe chatbantu.db before starting
-#    ./dev.sh --port 9000      Use a custom port
-#    ./dev.sh --no-browser     Don't auto-open the browser
-#    ./dev.sh --docker         Run inside Docker (uses Dockerfile.dev)
-#    ./dev.sh --help           Show this help
+#  ChatBantu v2 — Local Development Launcher
+#  Real-time: Bantu HTTP + WebSocket Relay
 # ════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# ── Resolve repo dir (where this script lives) ───────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# ── Defaults ─────────────────────────────────────────────────────────
 PORT="${PORT:-8080}"
+WS_PORT="${WS_PORT:-8081}"
 DB_PATH="${DB_PATH:-./chatbantu.db}"
 OPEN_BROWSER=1
 REBUILD=0
 RESET_DB=0
 USE_DOCKER=0
 
-# ── Parse args ───────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build)         REBUILD=1; shift ;;
@@ -43,26 +25,25 @@ while [[ $# -gt 0 ]]; do
     --docker)        USE_DOCKER=1; shift ;;
     --help|-h)
       cat <<'EOF'
-ChatBantu — Local Development Launcher
+ChatBantu v2 — Real-Time Social Network
 
 Usage:
   ./dev.sh                  Run the app (default)
-  ./dev.sh --build          Rebuild Bantu from source first
+  ./dev.sh --build          Rebuild Bantu + wsrelay from source
   ./dev.sh --reset-db       Wipe chatbantu.db before starting
-  ./dev.sh --port 9000      Use a custom port
+  ./dev.sh --port 9000      Use a custom HTTP port
   ./dev.sh --no-browser     Don't auto-open the browser
-  ./dev.sh --docker         Run inside Docker (uses Dockerfile.dev)
+  ./dev.sh --docker         Run inside Docker
   ./dev.sh --help           Show this help
 
-Steps performed (native mode):
-  1. Check bantu binary + shared libraries
-  2. (Optional) Rebuild bantu from source
-  3. (Optional) Reset SQLite DB
-  4. Start the ChatBantu backend in the foreground
-  5. (Optional) Open browser to http://localhost:$PORT
+Architecture:
+  Bantu HTTP server  → http://localhost:8080
+  WebSocket relay     → ws://localhost:8081
+  Embedded TURN       → localhost:3478 (Bantu v1.3.0)
 
 Environment variables:
-  PORT      Port to listen on (default: 8080)
+  PORT      HTTP port (default: 8080)
+  WS_PORT   WebSocket relay port (default: 8081)
   DB_PATH   SQLite path (default: ./chatbantu.db)
 EOF
       exit 0 ;;
@@ -73,94 +54,108 @@ done
 export PORT
 export DB_PATH
 
-# ─────────────────────────────────────────────────────────────────────
-#  Docker mode — hand off to docker compose
-# ─────────────────────────────────────────────────────────────────────
 if [[ "$USE_DOCKER" -eq 1 ]]; then
   echo "▶ Starting ChatBantu in Docker (port $PORT)…"
   if ! command -v docker >/dev/null 2>&1; then
-    echo "✗ docker not found. Install Docker: https://docs.docker.com/get-docker/" >&2
-    exit 1
+    echo "✗ docker not found." >&2; exit 1
   fi
   PORT="$PORT" docker compose -f docker-compose.dev.yml up --build
   exit 0
 fi
 
-# ─────────────────────────────────────────────────────────────────────
-#  Native mode
-# ─────────────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  ChatBantu — Local Dev                                       ║"
+echo "║  ChatBantu v2 — Real-Time Social Network                    ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo
 
-# ── 1. Check for bantu binary ────────────────────────────────────────
+# Check for bantu binary
 BANTU_BIN="$SCRIPT_DIR/bantu"
 if [[ ! -x "$BANTU_BIN" ]]; then
   echo "✗ Bantu binary not found at: $BANTU_BIN"
-  echo
-  echo "You can rebuild it from source:"
-  echo "  ./dev.sh --build"
-  echo
-  echo "Or run in Docker (no local build needed):"
-  echo "  ./dev.sh --docker"
+  echo "  Run: ./dev.sh --build"
   exit 1
 fi
 
-# ── 2. Check shared libraries ────────────────────────────────────────
+# Check for wsrelay binary
+WSRELAY_BIN="$SCRIPT_DIR/wsrelay"
+if [[ ! -x "$WSRELAY_BIN" ]]; then
+  echo "▶ wsrelay not found, building from source…"
+  if command -v gcc >/dev/null 2>&1; then
+    gcc -O2 -pthread -o "$WSRELAY_BIN" "$SCRIPT_DIR/wsrelay.c" -lsqlite3
+    echo "  ✓ wsrelay built"
+  else
+    echo "✗ gcc not found. Cannot build wsrelay."
+    exit 1
+  fi
+fi
+
+# Check shared libraries
 echo "▶ Checking shared libraries…"
-MISSING_LIBS=()
 ldd "$BANTU_BIN" 2>/dev/null | grep -E "not found" && {
-  echo "✗ Missing shared libraries detected. Install them:"
-  echo
-  echo "  Debian/Ubuntu:  sudo apt-get install -y libsqlite3-0 libcurl4 ca-certificates"
-  echo "  Fedora:         sudo dnf install -y libsqlite3x libcurl ca-certificates"
-  echo "  Alpine:         apk add sqlite-libs curl ca-certificates"
-  echo "  macOS:          brew install sqlite curl ca-certificates"
-  echo
-  echo "Or run in Docker instead:  ./dev.sh --docker"
+  echo "✗ Missing shared libraries."
   exit 1
 } || echo "  ✓ All shared libraries available"
 
-# ── 3. Optional: rebuild from source ─────────────────────────────────
+# Optional: rebuild
 if [[ "$REBUILD" -eq 1 ]]; then
-  echo
   echo "▶ Rebuilding Bantu from source…"
-  if [[ ! -d "$SCRIPT_DIR/bantu-src/compiler" ]]; then
-    echo "✗ bantu-src/compiler/ not found — cannot rebuild."
-    exit 1
-  fi
   cd "$SCRIPT_DIR/bantu-src/compiler"
   if [[ ! -x ./build.sh ]]; then chmod +x ./build.sh; fi
   ./build.sh
   cp -f ./build/bantu "$SCRIPT_DIR/bantu"
   chmod +x "$SCRIPT_DIR/bantu"
   cd "$SCRIPT_DIR"
-  echo "  ✓ New bantu binary installed: $(./bantu --version 2>&1 | head -1)"
+  echo "  ✓ Bantu rebuilt"
+
+  echo "▶ Rebuilding wsrelay…"
+  gcc -O2 -pthread -o "$WSRELAY_BIN" "$SCRIPT_DIR/wsrelay.c" -lsqlite3
+  echo "  ✓ wsrelay rebuilt"
 fi
 
-# ── 4. Optional: reset DB ────────────────────────────────────────────
+# Optional: reset DB
 if [[ "$RESET_DB" -eq 1 ]]; then
-  echo
   echo "▶ Resetting database…"
   rm -f "$SCRIPT_DIR/chatbantu.db" "$SCRIPT_DIR/chatbantu.db-wal" "$SCRIPT_DIR/chatbantu.db-shm"
-  echo "  ✓ Deleted chatbantu.db"
+  echo "  ✓ Database deleted"
 fi
 
-# ── 5. Show runtime info ─────────────────────────────────────────────
 echo
 echo "──────────────────────────────────────────────────────────────────"
-echo "  Binary:   $BANTU_BIN"
-echo "  Version:  $("$BANTU_BIN" --version 2>&1 | head -1)"
-echo "  App:      $SCRIPT_DIR/server.b"
-echo "  Port:     $PORT"
+echo "  Bantu:    $BANTU_BIN"
+echo "  Relay:    $WSRELAY_BIN"
+echo "  HTTP:     http://localhost:$PORT"
+echo "  WebSocket:ws://localhost:$WS_PORT"
+echo "  TURN:     embedded (port 3478)"
 echo "  DB:       $DB_PATH"
-echo "  URL:      http://localhost:$PORT"
-echo "  Demo user: silivestir / bantu123"
+echo "  Demo:     silivestir / bantu123"
 echo "──────────────────────────────────────────────────────────────────"
 echo
 
-# ── 6. Open browser (in background, after a short delay) ─────────────
+# Cleanup function
+cleanup() {
+  echo ""
+  echo "▶ Shutting down…"
+  kill $WSRELAY_PID 2>/dev/null || true
+  wait $WSRELAY_PID 2>/dev/null || true
+  echo "  ✓ Stopped"
+  exit 0
+}
+trap cleanup SIGINT SIGTERM
+
+# Start WebSocket relay in background
+echo "▶ Starting WebSocket relay on port $WS_PORT…"
+"$WSRELAY_BIN" "$WS_PORT" "$DB_PATH" &
+WSRELAY_PID=$!
+sleep 0.5
+
+# Verify relay started
+if ! kill -0 $WSRELAY_PID 2>/dev/null; then
+  echo "✗ WebSocket relay failed to start"
+  exit 1
+fi
+echo "  ✓ WebSocket relay running (pid $WSRELAY_PID)"
+
+# Open browser
 if [[ "$OPEN_BROWSER" -eq 1 ]]; then
   (sleep 1.5 && {
     URL="http://localhost:$PORT"
@@ -172,5 +167,9 @@ if [[ "$OPEN_BROWSER" -eq 1 ]]; then
   }) &
 fi
 
-# ── 7. Launch! (foreground — Ctrl-C to stop) ─────────────────────────
-exec "$BANTU_BIN" run "$SCRIPT_DIR/server.b"
+echo "▶ Starting Bantu HTTP server on port $PORT…"
+echo ""
+exec "$BANTU_BIN" run "$SCRIPT_DIR/server.b" &
+BANTU_PID=$!
+wait $BANTU_PID 2>/dev/null
+cleanup

@@ -14,7 +14,7 @@
       <div class="page-header">
         <div>
           <h1>Messages</h1>
-          <p>Real-time chat via HTTP polling</p>
+          <p>Real-time chat via WebSocket</p>
         </div>
       </div>
 
@@ -34,6 +34,19 @@
     </main>
   </div>
 
+  <!-- Incoming call overlay -->
+  <div class="call-overlay hidden" id="call-overlay">
+    <div class="call-overlay-box">
+      <div class="call-overlay-icon" id="call-overlay-icon">📞</div>
+      <div class="call-overlay-name" id="call-overlay-name">Unknown</div>
+      <div class="call-overlay-type" id="call-overlay-type">Voice call</div>
+      <div class="call-overlay-actions">
+        <button class="btn-circle end call-overlay-btn" onclick="declineCall()" title="Decline">📵</button>
+        <button class="btn-circle call-overlay-btn accept" onclick="acceptCall()" title="Accept" style="background:#27ae60">📞</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/js/api.js"></script>
   <script>
     if (!requireAuth()) throw new Error('redirect');
@@ -41,7 +54,7 @@
 
     let activePeer = null;
     let lastMsgId = 0;
-    let pollTimer = null;
+    let incomingCallFrom = null;
 
     // ─── Load conversation list ─────────────────────────────
     async function loadConversations() {
@@ -53,16 +66,18 @@
           el.innerHTML = '<p style="color:#7a6a5a;font-size:13px;padding:8px">No conversations yet. <a href="/people.html">Find someone to chat with</a>.</p>';
           return;
         }
-        el.innerHTML = r.conversations.map(c => `
+        el.innerHTML = r.conversations.map(c => {
+          const isOnline = WS.isUserOnline(c.peer.id) || c.peer.online;
+          return `
           <div class="conv-item ${activePeer == c.peer.id ? 'active' : ''}" onclick="openChat(${c.peer.id}, '${escapeHtml(c.peer.displayName)}')">
             <div class="avatar">${avatarLetter(c.peer.displayName)}</div>
             <div class="info">
               <div class="name">${escapeHtml(c.peer.displayName)}</div>
               <div class="last-msg">${escapeHtml(c.lastMessage.body.slice(0, 40))}</div>
             </div>
-            <div class="dot ${c.peer.online ? '' : 'offline'}"></div>
-          </div>
-        `).join('');
+            <div class="dot ${isOnline ? '' : 'offline'}"></div>
+          </div>`;
+        }).join('');
       } catch (e) { /* ignore */ }
     }
 
@@ -70,13 +85,14 @@
     async function openChat(peerId, peerName) {
       activePeer = peerId;
       lastMsgId = 0;
+      const isOnline = WS.isUserOnline(peerId);
       const panel = document.getElementById('chat-panel');
       panel.innerHTML = `
         <div class="chat-head">
           <div class="avatar" id="peer-avatar">${avatarLetter(peerName)}</div>
           <div>
             <div class="name" id="peer-name">${escapeHtml(peerName)}</div>
-            <div class="status" id="peer-status">connecting…</div>
+            <div class="status" id="peer-status">${isOnline ? '🟢 Online' : 'Offline'}</div>
           </div>
           <div class="call-btns">
             <button class="call-btn" title="Voice call" onclick="startCall('${escapeHtml(peerName)}', ${peerId}, false)">📞</button>
@@ -90,42 +106,58 @@
         </div>
       `;
       document.getElementById('msg-input').focus();
-      // Refresh conversation list highlight
       await loadConversations();
-      // Pull initial messages
-      await pollMessages();
-      // Start polling every 1.5s
-      if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(pollMessages, 1500);
+      // Pull message history once (no polling)
+      await loadHistory();
     }
 
-    async function pollMessages() {
+    async function loadHistory() {
       if (!activePeer) return;
       try {
-        const r = await api.get('/api/messages/' + activePeer + '?since=' + lastMsgId);
+        const r = await api.get('/api/messages/' + activePeer);
         if (r && r.error) return;
         const msgs = r.messages || [];
         const me = api.user();
         const box = document.getElementById('chat-messages');
         if (!box) return;
-        let scrolled = false;
+        box.innerHTML = '';
         msgs.forEach(m => {
-          if (m.id > lastMsgId) {
-            const mine = m.fromId == me.id;
-            const div = document.createElement('div');
-            div.className = 'msg-bubble ' + (mine ? 'me' : 'them');
-            div.innerHTML = escapeHtml(m.body) + '<span class="time">' + (m.createdAt || '').slice(11, 16) + '</span>';
-            box.appendChild(div);
-            lastMsgId = m.id;
-            scrolled = true;
-          }
+          const mine = m.fromId == me.id;
+          const div = document.createElement('div');
+          div.className = 'msg-bubble ' + (mine ? 'me' : 'them');
+          div.innerHTML = escapeHtml(m.body) + '<span class="time">' + (m.createdAt || '').slice(11, 16) + '</span>';
+          box.appendChild(div);
+          if (m.id > lastMsgId) lastMsgId = m.id;
         });
-        if (scrolled) {
-          box.scrollTop = box.scrollHeight;
-        }
+        box.scrollTop = box.scrollHeight;
       } catch (e) { /* ignore */ }
     }
 
+    // ─── Real-time message handler ──────────────────────────
+    // This fires the instant a message arrives via WebSocket
+    function onRealTimeMessage(msg) {
+      const me = api.user();
+      // Only show if it's for the active chat, or refresh conv list
+      if (msg.data && msg.from) {
+        if (activePeer == msg.from) {
+          // Append to active chat
+          const box = document.getElementById('chat-messages');
+          if (box) {
+            const div = document.createElement('div');
+            div.className = 'msg-bubble them';
+            const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            div.innerHTML = escapeHtml(msg.data.body || msg.data) + '<span class="time">' + time + '</span>';
+            box.appendChild(div);
+            box.scrollTop = box.scrollHeight;
+          }
+        }
+        // Always refresh conversation list on new message
+        loadConversations();
+      }
+    }
+
+    // ─── Send message via HTTP (persists to DB) ─────────────
+    // The recipient gets it in real-time via the WS relay
     async function sendMsg() {
       if (!activePeer) return;
       const inp = document.getElementById('msg-input');
@@ -135,23 +167,84 @@
       try {
         const r = await api.post('/api/messages/' + activePeer, { body });
         if (r && r.error) { toast(r.error); return; }
-        await pollMessages();
+        // Show our own message instantly in the chat
+        const box = document.getElementById('chat-messages');
+        if (box) {
+          const div = document.createElement('div');
+          div.className = 'msg-bubble me';
+          const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          div.innerHTML = escapeHtml(body) + '<span class="time">' + time + '</span>';
+          box.appendChild(div);
+          box.scrollTop = box.scrollHeight;
+        }
       } catch (e) {
         toast('Failed to send: ' + e.message);
       }
     }
 
+    // ─── Call actions ───────────────────────────────────────
     function startCall(peerName, peerId, video) {
       const params = new URLSearchParams({ peer: peerId, name: peerName, video: video ? '1' : '0', dir: 'out' });
       window.open('/call.html?' + params.toString(), '_blank', 'width=1100,height=800');
     }
 
+    // ─── Incoming call UI ───────────────────────────────────
+    function onIncomingCall(msg) {
+      if (msg.data && msg.from) {
+        incomingCallFrom = msg.from;
+        const hasVideo = msg.data.video;
+        document.getElementById('call-overlay-name').textContent = msg.fromName || 'Unknown';
+        document.getElementById('call-overlay-icon').textContent = hasVideo ? '📹' : '📞';
+        document.getElementById('call-overlay-type').textContent = hasVideo ? 'Video call' : 'Voice call';
+        document.getElementById('call-overlay').classList.remove('hidden');
+      }
+    }
+
+    function acceptCall() {
+      if (!incomingCallFrom) return;
+      const name = document.getElementById('call-overlay-name').textContent;
+      const hasVideo = document.getElementById('call-overlay-type').textContent === 'Video call';
+      document.getElementById('call-overlay').classList.add('hidden');
+      const params = new URLSearchParams({
+        peer: incomingCallFrom,
+        name: name,
+        video: hasVideo ? '1' : '0',
+        dir: 'in'
+      });
+      window.open('/call.html?' + params.toString(), '_blank', 'width=1100,height=800');
+      incomingCallFrom = null;
+    }
+
+    function declineCall() {
+      if (incomingCallFrom) {
+        WS.send(incomingCallFrom, 'call_hangup', {});
+      }
+      document.getElementById('call-overlay').classList.add('hidden');
+      incomingCallFrom = null;
+    }
+
+    // ─── Real-time presence updates ─────────────────────────
+    function onPresenceUpdate() {
+      loadConversations();
+      // Update active chat status dot
+      if (activePeer) {
+        const statusEl = document.getElementById('peer-status');
+        if (statusEl) {
+          statusEl.textContent = WS.isUserOnline(activePeer) ? '🟢 Online' : 'Offline';
+        }
+      }
+    }
+
     // ─── Bootstrap ──────────────────────────────────────────
     (async function init() {
+      // Register real-time WebSocket listeners (no polling)
+      WS.on('message', onRealTimeMessage);
+      WS.on('call_offer', onIncomingCall);
+      WS.on('presence', onPresenceUpdate);
+
       const params = new URLSearchParams(location.search);
       const peer = params.get('peer');
       if (peer) {
-        // Need to find the peer's display name first
         try {
           const users = await api.get('/api/users');
           const u = (users.users || []).find(x => x.id == peer);
@@ -162,8 +255,6 @@
         } catch (e) { /* fall through */ }
       }
       await loadConversations();
-      // Refresh conversation list every 5s
-      setInterval(loadConversations, 5000);
     })();
   </script>
 </body>

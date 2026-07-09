@@ -32,27 +32,47 @@
     </main>
   </div>
 
+  <!-- Incoming call overlay (feed can receive calls too) -->
+  <div class="call-overlay hidden" id="call-overlay">
+    <div class="call-overlay-box">
+      <div class="call-overlay-icon" id="call-overlay-icon">📞</div>
+      <div class="call-overlay-name" id="call-overlay-name">Unknown</div>
+      <div class="call-overlay-type" id="call-overlay-type">Voice call</div>
+      <div class="call-overlay-actions">
+        <button class="btn-circle end call-overlay-btn" onclick="declineCall()">📵</button>
+        <button class="btn-circle call-overlay-btn accept" onclick="acceptCall()" title="Accept" style="background:#27ae60">📞</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/js/api.js"></script>
   <script>
     if (!requireAuth()) throw new Error('redirect');
     renderSidebar('feed');
 
-    async function loadOnline() {
-      try {
-        const r = await api.get('/api/presence');
-        if (r && !r.error) {
-          const strip = document.getElementById('online-strip');
-          strip.innerHTML = r.online.map(u => `
-            <div class="online-chip" onclick="location.href='/chat.html?peer=${u.id}'">
-              <div class="avatar">${avatarLetter(u.displayName)}</div>
-              <div class="name">${escapeHtml(u.displayName.split(' ')[0])}</div>
-              <div class="dot"></div>
-            </div>
-          `).join('') || '<p style="color:#7a6a5a;font-size:13px;padding:4px 8px">No one else is online right now.</p>';
-        }
-      } catch (e) { /* ignore */ }
+    // ─── Online strip (real-time via WebSocket) ────────────
+    function renderOnlineStrip() {
+      const users = WS.getOnlineUsers();
+      const me = api.user();
+      const strip = document.getElementById('online-strip');
+      const filtered = users.filter(u => u.id !== me.id);
+      if (filtered.length === 0) {
+        strip.innerHTML = '<p style="color:#7a6a5a;font-size:13px;padding:4px 8px">No one else is online right now.</p>';
+        return;
+      }
+      strip.innerHTML = filtered.map(u => `
+        <div class="online-chip" onclick="location.href='/chat.html?peer=${u.id}'">
+          <div class="avatar">${avatarLetter(u.displayName || u.username)}</div>
+          <div class="name">${escapeHtml((u.displayName || u.username).split(' ')[0])}</div>
+          <div class="dot"></div>
+        </div>
+      `).join('');
     }
 
+    WS.on('presence', renderOnlineStrip);
+    WS.on('connected', renderOnlineStrip);
+
+    // ─── Posts (no polling — user can refresh manually) ─────
     async function loadPosts() {
       try {
         const r = await api.get('/api/posts');
@@ -121,7 +141,6 @@
         return;
       }
       if (el.children.length === 0) {
-        // First open: fetch and render
         await fetchComments(id);
       }
       el.classList.remove('hidden');
@@ -182,11 +201,49 @@
       }
     }
 
-    // Initial load
-    loadOnline();
+    // ─── Incoming call handling ────────────────────────────
+    let incomingCallFrom = null;
+
+    function onIncomingCall(msg) {
+      if (msg.data && msg.from) {
+        incomingCallFrom = msg.from;
+        const hasVideo = msg.data.video;
+        document.getElementById('call-overlay-name').textContent = msg.fromName || 'Unknown';
+        document.getElementById('call-overlay-icon').textContent = hasVideo ? '📹' : '📞';
+        document.getElementById('call-overlay-type').textContent = hasVideo ? 'Video call' : 'Voice call';
+        document.getElementById('call-overlay').classList.remove('hidden');
+      }
+    }
+
+    function acceptCall() {
+      if (!incomingCallFrom) return;
+      const name = document.getElementById('call-overlay-name').textContent;
+      const hasVideo = document.getElementById('call-overlay-type').textContent === 'Video call';
+      document.getElementById('call-overlay').classList.add('hidden');
+      const params = new URLSearchParams({ peer: incomingCallFrom, name: name, video: hasVideo ? '1' : '0', dir: 'in' });
+      window.open('/call.html?' + params.toString(), '_blank', 'width=1100,height=800');
+      incomingCallFrom = null;
+    }
+
+    function declineCall() {
+      if (incomingCallFrom) {
+        WS.send(incomingCallFrom, 'call_hangup', {});
+      }
+      document.getElementById('call-overlay').classList.add('hidden');
+      incomingCallFrom = null;
+    }
+
+    WS.on('call_offer', onIncomingCall);
+
+    // ─── Initial load ───────────────────────────────────────
     loadPosts();
-    // Refresh presence every 30s
-    setInterval(loadOnline, 30000);
+    // Initial presence (fallback before WS connects)
+    api.get('/api/presence').then(r => {
+      if (r && !r.error && r.online) {
+        r.online.forEach(u => { WS._onlineUsers[u.id] = u; });
+        renderOnlineStrip();
+      }
+    }).catch(() => {});
   </script>
 </body>
 </html>

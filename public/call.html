@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ChatBantu — Video Call</title>
+  <title>ChatBantu — Call</title>
   <link rel="stylesheet" href="/css/styles.css" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%B9%3C/text%3E%3C/svg%3E" />
 </head>
@@ -36,24 +36,26 @@
     const peerId  = parseInt(params.get('peer'));
     const peerName= params.get('name') || 'User';
     const wantVideo = params.get('video') === '1';
-    const direction  = params.get('dir') || 'out';   // 'out' = caller, 'in' = callee
+    const direction  = params.get('dir') || 'out';
 
     document.getElementById('remote-label').textContent = peerName;
 
-    // ─── WebRTC setup ────────────────────────────────────
-    const STUN_SERVERS = {
+    // ─── ICE Configuration ───────────────────────────────
+    // Bantu v1.3.0 embedded TURN server — same host, port 3478
+    // Falls back to Google STUN for clients behind strict NATs
+    const ICE_CONFIG = {
       iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
+        { urls: 'turn:' + location.hostname + ':3478', username: 'bantu', credential: 'bantu123' },
+        { urls: 'stun:' + location.hostname + ':3478' },
+        { urls: 'stun:stun.l.google.com:19302' }
       ]
     };
+
     let pc = null;
     let localStream = null;
     let remoteStream = null;
     let muted = false;
     let videoOff = false;
-    let icePollTimer = null;
-    let offerPollTimer = null;
 
     function setStatus(text) {
       document.getElementById('call-status').textContent = text;
@@ -66,10 +68,9 @@
           video: wantVideo
         });
       } catch (e) {
-        // Fallback: audio-only
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-          toast('Camera unavailable — falling back to audio-only');
+          toast('Camera unavailable — audio-only call');
         } catch (e2) {
           throw new Error('Cannot access microphone/camera: ' + e2.message);
         }
@@ -78,89 +79,109 @@
     }
 
     function createPeerConnection() {
-      pc = new RTCPeerConnection(STUN_SERVERS);
+      pc = new RTCPeerConnection(ICE_CONFIG);
+
       // Add local tracks
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
       // Receive remote tracks
       remoteStream = new MediaStream();
       document.getElementById('remote-video').srcObject = remoteStream;
       pc.ontrack = (event) => {
         event.streams[0].getTracks().forEach(t => remoteStream.addTrack(t));
       };
-      // ICE candidates → push to signaling server
+
+      // ICE candidates → send via WebSocket (real-time, zero polling)
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          api.post('/api/call/ice/' + peerId, { candidate: JSON.stringify(event.candidate) }).catch(() => {});
+          WS.send(peerId, 'call_ice', { candidate: event.candidate });
         }
       };
+
       pc.onconnectionstatechange = () => {
-        setStatus('Connection: ' + pc.connectionState);
+        const state = pc.connectionState;
+        setStatus('Connection: ' + state);
+        if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+          setStatus('Call ended (' + state + ')');
+          setTimeout(() => window.close(), 1500);
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        if (state === 'connected' || state === 'completed') {
+          setStatus('Connected — call in progress');
+        }
       };
     }
 
+    // ─── Caller flow ─────────────────────────────────────
     async function startAsCaller() {
       setStatus('Calling ' + peerName + '…');
       await getLocalMedia();
       createPeerConnection();
+
       const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
       await pc.setLocalDescription(offer);
-      await api.post('/api/call/offer/' + peerId, { sdp: JSON.stringify(offer) });
-      // Poll for answer
-      offerPollTimer = setInterval(async () => {
-        try {
-          const r = await api.get('/api/call/answer/' + peerId);
-          if (r.hasAnswer) {
-            clearInterval(offerPollTimer);
-            offerPollTimer = null;
-            const answer = JSON.parse(r.sdp);
-            await pc.setRemoteDescription(new RTCSessionDescription(answer));
-            setStatus('Connected — call in progress');
-            startIcePolling();
-          }
-        } catch (e) { /* ignore */ }
-      }, 1000);
+
+      // Send offer via WebSocket — no polling
+      WS.send(peerId, 'call_offer', { sdp: offer, video: wantVideo });
+      setStatus('Ringing…');
+
+      // Listen for answer via WebSocket
+      WS.on('call_answer', onAnswer);
+      WS.on('call_ice', onIceCandidate);
+      WS.on('call_hangup', onHangup);
     }
 
-    async function startAsCallee() {
+    // ─── Callee flow ─────────────────────────────────────
+    async function startAsCallee(offerData) {
       setStatus('Incoming call from ' + peerName + ' — accepting…');
       await getLocalMedia();
       createPeerConnection();
-      // Poll for offer
-      const pollOffer = setInterval(async () => {
-        try {
-          const r = await api.get('/api/call/offer/' + peerId);
-          if (r.hasOffer) {
-            clearInterval(pollOffer);
-            const offer = JSON.parse(r.sdp);
-            await pc.setRemoteDescription(new RTCSessionDescription(offer));
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            await api.post('/api/call/answer/' + peerId, { sdp: JSON.stringify(answer) });
-            setStatus('Connected — call in progress');
-            startIcePolling();
-          }
-        } catch (e) { /* ignore */ }
-      }, 1000);
-      // Stop polling after 30s if no offer
-      setTimeout(() => clearInterval(pollOffer), 30000);
+
+      const offer = new RTCSessionDescription(offerData.sdp);
+      await pc.setRemoteDescription(offer);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      // Send answer via WebSocket — instant
+      WS.send(peerId, 'call_answer', { sdp: answer });
+
+      WS.on('call_ice', onIceCandidate);
+      WS.on('call_hangup', onHangup);
     }
 
-    function startIcePolling() {
-      if (icePollTimer) return;
-      icePollTimer = setInterval(async () => {
-        try {
-          const r = await api.get('/api/call/ice/' + peerId);
-          if (r.candidates) {
-            for (const c of r.candidates) {
-              try {
-                await pc.addIceCandidate(new RTCIceCandidate(JSON.parse(c)));
-              } catch (e) { /* ignore */ }
-            }
-          }
-        } catch (e) { /* ignore */ }
-      }, 1000);
+    // ─── WebSocket event handlers ────────────────────────
+    function onAnswer(msg) {
+      if (msg.from !== peerId) return;
+      WS.off('call_answer', onAnswer);
+      const answer = new RTCSessionDescription(msg.data.sdp);
+      pc.setRemoteDescription(answer).then(() => {
+        setStatus('Connected — call in progress');
+      }).catch(e => {
+        setStatus('Error setting answer: ' + e.message);
+      });
     }
 
+    function onIceCandidate(msg) {
+      if (msg.from !== peerId) return;
+      if (msg.data && msg.data.candidate) {
+        try {
+          pc.addIceCandidate(new RTCIceCandidate(msg.data.candidate));
+        } catch (e) { /* ignore stale candidates */ }
+      }
+    }
+
+    function onHangup(msg) {
+      if (msg.from !== peerId) return;
+      setStatus('Call ended by ' + peerName);
+      cleanupCall();
+      setTimeout(() => window.close(), 1500);
+    }
+
+    // ─── Controls ────────────────────────────────────────
     function toggleMute() {
       if (!localStream) return;
       muted = !muted;
@@ -176,35 +197,58 @@
     }
 
     async function endCall() {
-      if (icePollTimer) clearInterval(icePollTimer);
-      if (offerPollTimer) clearInterval(offerPollTimer);
-      try { await api.post('/api/call/hangup/' + peerId, {}); } catch (e) {}
-      if (pc) { try { pc.close(); } catch (e) {} pc = null; }
-      if (localStream) localStream.getTracks().forEach(t => t.stop());
+      // Notify peer via WebSocket
+      WS.send(peerId, 'call_hangup', {});
       setStatus('Call ended');
-      setTimeout(() => window.close(), 1500);
+      cleanupCall();
+      setTimeout(() => window.close(), 1000);
+    }
+
+    function cleanupCall() {
+      WS.off('call_answer', onAnswer);
+      WS.off('call_ice', onIceCandidate);
+      WS.off('call_hangup', onHangup);
+      if (pc) { try { pc.close(); } catch(e) {} pc = null; }
+      if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
     }
 
     // Cleanup on tab close
     window.addEventListener('beforeunload', () => {
-      if (pc) { try { pc.close(); } catch (e) {} }
-      if (localStream) localStream.getTracks().forEach(t => t.stop());
-      try { api.post('/api/call/hangup/' + peerId, {}); } catch (e) {}
+      WS.send(peerId, 'call_hangup', {});
+      cleanupCall();
     });
 
-    // Bootstrap
+    // ─── Bootstrap ───────────────────────────────────────
     (async function() {
+      // Wait for WebSocket to be connected
+      if (!WS.isConnected()) {
+        WS.on('connected', () => bootstrap());
+        setStatus('Connecting to server…');
+        return;
+      }
+      bootstrap();
+    })();
+
+    async function bootstrap() {
       try {
         if (direction === 'out') {
           await startAsCaller();
         } else {
-          await startAsCallee();
+          // For incoming calls, the offer comes via WebSocket.
+          // The chat.html or feed.html page will open this window
+          // after receiving a call_offer event.
+          setStatus('Waiting for call signal…');
+          WS.on('call_offer', function onOffer(msg) {
+            if (msg.from !== peerId) return;
+            WS.off('call_offer', onOffer);
+            startAsCallee(msg.data);
+          });
         }
       } catch (e) {
         setStatus('Error: ' + e.message);
         toast(e.message, 5000);
       }
-    })();
+    }
   </script>
 </body>
 </html>
